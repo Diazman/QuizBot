@@ -1,0 +1,28 @@
+name = "quizbot"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+workers_dev = true
+
+[observability]
+enabled = true
+
+[vars]
+NVIDIA_MODEL = "z-ai/glm-5.3-flash"
+# BOT_USERNAME = "your_bot"   # optional; looked up automatically otherwise
+
+[[d1_databases]]
+binding = "DB"
+database_name = "quizbot-db"
+database_id = "REPLACE_WITH_D1_ID"   # filled in automatically by scripts/deploy.sh
+migrations_dir = "migrations"
+
+[[queues.producers]]
+binding = "QUIZ_QUEUE"
+queue = "quizbot-jobs"
+
+[[queues.consumers]]
+queue = "quizbot-jobs"
+max_batch_size = 1        # one chunk (~20 questions) per AI call
+max_batch_timeout = 1
+max_concurrency = 2       # stay under NVIDIA free-tier rate limits
+max_retries = 5

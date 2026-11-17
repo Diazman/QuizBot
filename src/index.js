@@ -1,0 +1,445 @@
+// QuizBot — Cloudflare Worker entry point.
+//  fetch: Telegram webhook (commands, uploads, poll answers)
+//  queue: AI processing of question chunks (runs in the background, retried on failure)
+
+import { extractQuestions } from "./ai.js";
+import { buildPoll, normalizeQuestion, parseQuizJson, randomCode, shuffle, splitIntoChunks } from "./format.js";
+import { fileToText } from "./files.js";
+import { esc, tg, webhookSecret } from "./telegram.js";
+
+const MAX_DRAFT_CHARS = 400_000;
+const now = () => Math.floor(Date.now() / 1000);
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === "/") return new Response("QuizBot is running.");
+    if (request.method !== "POST" || url.pathname !== "/webhook") return new Response("Not found", { status: 404 });
+
+    const secret = await webhookSecret(env.TELEGRAM_BOT_TOKEN);
+    if (request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== secret) {
+      return new Response("Forbidden", { status: 403 });
+    }
+    const update = await request.json();
+    try {
+      await handleUpdate(update, env);
+    } catch (err) {
+      console.error("update failed", err?.stack || err);
+      const chatId = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
+      if (chatId) ctx.waitUntil(tg(env).send(chatId, `⚠️ Error: ${esc(err.message || err)}`).catch(() => {}));
+    }
+    // Always 200 so Telegram doesn't redeliver the same update forever.
+    return new Response("ok");
+  },
+
+  async queue(batch, env) {
+    for (const msg of batch.messages) {
+      try {
+        await processChunk(env, msg.body.quizId, msg.body.idx);
+        msg.ack();
+      } catch (err) {
+        console.error("chunk failed", msg.body, err?.message);
+        if (err.retryable !== false && msg.attempts < 4) {
+          msg.retry({ delaySeconds: 20 * msg.attempts });
+        } else {
+          await failChunk(env, msg.body.quizId, msg.body.idx, String(err.message || err));
+          msg.ack();
+        }
+      }
+    }
+  },
+};
+
+// ───────────────────────────── updates ─────────────────────────────
+
+async function handleUpdate(update, env) {
+  if (update.poll_answer) return onPollAnswer(update.poll_answer, env);
+  if (update.callback_query) return onCallback(update.callback_query, env);
+  const msg = update.message;
+  if (!msg || !msg.from) return;
+  if (msg.chat.type !== "private") return; // practice & uploads happen in private chat
+
+  const api = tg(env);
+  if (msg.document) return onDocument(msg, env);
+
+  const text = (msg.text || "").trim();
+  if (!text) return;
+  if (!text.startsWith("/")) return onPlainText(msg, env);
+
+  const [rawCmd, ...rest] = text.split(/\s+/);
+  const cmd = rawCmd.split("@")[0].toLowerCase();
+  const arg = rest.join(" ").trim();
+  const uid = msg.from.id;
+  const chat = msg.chat.id;
+
+  switch (cmd) {
+    case "/start":
+      if (arg.startsWith("q_")) return offerQuiz(env, chat, arg.slice(2));
+      return api.send(chat, HELP);
+    case "/help":
+      return api.send(chat, HELP);
+    case "/new": {
+      const title = arg || `Quiz ${new Date().toISOString().slice(0, 10)}`;
+      const quiz = await createQuiz(env, uid, title);
+      await env.DB.prepare("INSERT OR REPLACE INTO drafts (user_id, quiz_id) VALUES (?, ?)").bind(uid, quiz.id).run();
+      return api.send(chat,
+        `📝 New quiz <b>${esc(title)}</b>.\n\nNow send me the questions: paste them as messages (as many as you need) and/or upload <b>.txt</b> / <b>.docx</b> files.\nWhen everything is sent, type /done.`);
+    }
+    case "/done": {
+      const draft = await getDraft(env, uid);
+      if (!draft) return api.send(chat, "You have no open draft. Start one with /new <i>title</i>.");
+      if (!draft.raw_text.trim()) return api.send(chat, "The draft is empty — send some questions first.");
+      await env.DB.prepare("DELETE FROM drafts WHERE user_id = ?").bind(uid).run();
+      return startProcessing(env, draft, chat);
+    }
+    case "/cancel": {
+      const draft = await getDraft(env, uid);
+      if (draft) await deleteQuiz(env, draft.id);
+      await env.DB.prepare("DELETE FROM drafts WHERE user_id = ?").bind(uid).run();
+      return api.send(chat, draft ? "Draft discarded." : "Nothing to cancel.");
+    }
+    case "/my":
+      return listQuizzes(env, uid, chat);
+    case "/export":
+      return exportQuiz(env, uid, chat, arg);
+    case "/delete": {
+      const quiz = await ownedQuiz(env, uid, arg);
+      if (!quiz) return api.send(chat, "Usage: /delete <i>code</i> (see /my)");
+      await deleteQuiz(env, quiz.id);
+      return api.send(chat, `🗑 Deleted <b>${esc(quiz.title)}</b>.`);
+    }
+    case "/retry": {
+      const quiz = await ownedQuiz(env, uid, arg);
+      if (!quiz) return api.send(chat, "Usage: /retry <i>code</i> (see /my)");
+      return retryFailed(env, quiz, chat);
+    }
+    case "/practice": {
+      const code = arg.replace(/^q_/, "");
+      if (!code) return api.send(chat, "Usage: /practice <i>code</i>");
+      return offerQuiz(env, chat, code);
+    }
+    case "/stop": {
+      const s = await env.DB.prepare("SELECT * FROM sessions WHERE user_id = ?").bind(uid).first();
+      if (!s) return api.send(chat, "No quiz running.");
+      await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(uid).run();
+      return api.send(chat, `⏹ Stopped. Score: <b>${s.score}/${s.idx}</b>.`);
+    }
+    default:
+      return api.send(chat, "Unknown command. /help");
+  }
+}
+
+const HELP = `🇷🇺 <b>Russian Quiz Bot</b>
+
+<b>Create a quiz</b>
+1. /new <i>title</i>
+2. Send your questions (paste text or upload .txt / .docx). Any format works — numbered questions with A/B/C/D options are perfect. If you already marked answers (e.g. "Ответ: Б" or bold), the AI uses them; otherwise it solves the questions itself.
+3. /done — the AI finds the correct answers and builds the quiz polls.
+Tip: you can also just upload a file without /new — it becomes a quiz straight away.
+
+<b>Share &amp; practise</b>
+After processing you get a link. Anyone who opens it gets the questions as Telegram quiz polls, one by one, with a score at the end.
+
+<b>Commands</b>
+/my — your quizzes and share links
+/practice <i>code</i> — practise a quiz
+/export <i>code</i> — download the quiz in bot format (JSON). Edit it and upload it back to fix answers.
+/retry <i>code</i> — re-run parts that failed
+/delete <i>code</i> — delete a quiz
+/stop — stop the current practice
+/cancel — discard the current draft`;
+
+// ───────────────────────────── creating quizzes ─────────────────────────────
+
+async function createQuiz(env, ownerId, title, status = "draft") {
+  for (let i = 0; i < 5; i++) {
+    const code = randomCode();
+    const row = await env.DB.prepare(
+      "INSERT OR IGNORE INTO quizzes (code, owner_id, title, status, created_at) VALUES (?, ?, ?, ?, ?) RETURNING *",
+    ).bind(code, ownerId, title.slice(0, 120), status, now()).first();
+    if (row) return row;
+  }
+  throw new Error("Could not allocate a quiz code");
+}
+
+const getDraft = (env, uid) =>
+  env.DB.prepare("SELECT q.* FROM drafts d JOIN quizzes q ON q.id = d.quiz_id WHERE d.user_id = ?").bind(uid).first();
+
+async function appendToDraft(env, draft, text) {
+  if (draft.raw_text.length + text.length > MAX_DRAFT_CHARS) throw new Error("Draft is too large (max ~400k characters). Send /done or split into several quizzes.");
+  const row = await env.DB.prepare("UPDATE quizzes SET raw_text = raw_text || ? WHERE id = ? RETURNING length(raw_text) AS n")
+    .bind(`\n\n${text}`, draft.id).first();
+  return row.n;
+}
+
+async function onPlainText(msg, env) {
+  const api = tg(env);
+  const draft = await getDraft(env, msg.from.id);
+  if (!draft) {
+    return api.send(msg.chat.id, "To create a quiz, first send /new <i>title</i>, then paste the questions. /help");
+  }
+  const n = await appendToDraft(env, draft, msg.text);
+  return api.send(msg.chat.id, `➕ Added. Draft size: ${n.toLocaleString("en")} characters. Send more, or /done to process.`);
+}
+
+async function onDocument(msg, env) {
+  const api = tg(env);
+  const doc = msg.document;
+  const uid = msg.from.id;
+  if (doc.file_size > 10 * 1024 * 1024) return api.send(msg.chat.id, "File is too big (max 10 MB).");
+  const bytes = await api.downloadFile(doc.file_id);
+  const { kind, text } = await fileToText(bytes, doc.file_name || "");
+  const baseTitle = (msg.caption || (doc.file_name || "Quiz").replace(/\.[^.]+$/, "")).trim();
+
+  if (kind === "json") return importJson(env, uid, msg.chat.id, text, baseTitle);
+
+  if (!text.trim()) return api.send(msg.chat.id, "I couldn't find any text in that file.");
+  const draft = await getDraft(env, uid);
+  if (draft) {
+    const n = await appendToDraft(env, draft, text);
+    return api.send(msg.chat.id, `📎 File added to draft <b>${esc(draft.title)}</b>. Draft size: ${n.toLocaleString("en")} characters. Send more, or /done.`);
+  }
+  // No draft: the file is a whole quiz on its own.
+  const quiz = await createQuiz(env, uid, baseTitle);
+  await env.DB.prepare("UPDATE quizzes SET raw_text = ? WHERE id = ?").bind(text, quiz.id).run();
+  quiz.raw_text = text;
+  return startProcessing(env, quiz, msg.chat.id);
+}
+
+async function importJson(env, uid, chat, text, title) {
+  const api = tg(env);
+  let parsed;
+  try {
+    parsed = parseQuizJson(text);
+  } catch (e) {
+    return api.send(chat, `Could not read JSON: ${esc(e.message)}`);
+  }
+  if (!parsed.questions.length) return api.send(chat, "No valid questions found in that JSON.");
+  const quiz = await createQuiz(env, uid, parsed.title || title, "ready");
+  await insertQuestions(env, quiz.id, 0, parsed.questions);
+  return api.send(chat, await readyMessage(env, quiz, parsed.questions.length, 0));
+}
+
+async function startProcessing(env, quiz, chat) {
+  const api = tg(env);
+  const chunks = splitIntoChunks(quiz.raw_text);
+  if (!chunks.length) return api.send(chat, "Nothing to process.");
+  const stmts = chunks.map((text, idx) =>
+    env.DB.prepare("INSERT OR REPLACE INTO chunks (quiz_id, idx, text, status) VALUES (?, ?, ?, 'pending')").bind(quiz.id, idx, text));
+  stmts.push(env.DB.prepare(
+    "UPDATE quizzes SET status = 'processing', chunks_total = ?, chunks_done = 0, chunks_failed = 0 WHERE id = ?",
+  ).bind(chunks.length, quiz.id));
+  await env.DB.batch(stmts);
+
+  const messages = chunks.map((_, idx) => ({ body: { quizId: quiz.id, idx } }));
+  for (let i = 0; i < messages.length; i += 100) await env.QUIZ_QUEUE.sendBatch(messages.slice(i, i + 100));
+
+  return api.send(chat,
+    `🤖 Processing <b>${esc(quiz.title)}</b> in ${chunks.length} part(s)…\nThe AI is reading the questions and finding the correct answers. I'll message you when it's ready (usually a few minutes).`);
+}
+
+// ───────────────────────────── queue consumer ─────────────────────────────
+
+async function processChunk(env, quizId, idx) {
+  const chunk = await env.DB.prepare("SELECT * FROM chunks WHERE quiz_id = ? AND idx = ?").bind(quizId, idx).first();
+  if (!chunk || chunk.status !== "pending") return; // deleted quiz or already handled
+
+  const raw = await extractQuestions(env, chunk.text);
+  const questions = raw.map(normalizeQuestion).filter(Boolean);
+
+  const res = await env.DB.batch([
+    ...questionInserts(env, quizId, idx * 1000, questions),
+    env.DB.prepare("UPDATE chunks SET status = 'done', error = NULL WHERE quiz_id = ? AND idx = ?").bind(quizId, idx),
+    env.DB.prepare("UPDATE quizzes SET chunks_done = chunks_done + 1 WHERE id = ? RETURNING *").bind(quizId),
+  ]);
+  await maybeFinish(env, res[res.length - 1].results[0]);
+}
+
+async function failChunk(env, quizId, idx, error) {
+  const chunk = await env.DB.prepare("SELECT status FROM chunks WHERE quiz_id = ? AND idx = ?").bind(quizId, idx).first();
+  if (!chunk || chunk.status !== "pending") return;
+  const res = await env.DB.batch([
+    env.DB.prepare("UPDATE chunks SET status = 'failed', error = ? WHERE quiz_id = ? AND idx = ?").bind(error.slice(0, 500), quizId, idx),
+    env.DB.prepare("UPDATE quizzes SET chunks_failed = chunks_failed + 1 WHERE id = ? RETURNING *").bind(quizId),
+  ]);
+  await maybeFinish(env, res[1].results[0]);
+}
+
+async function maybeFinish(env, quiz) {
+  if (!quiz || quiz.chunks_done + quiz.chunks_failed < quiz.chunks_total) return;
+  const { n } = await env.DB.prepare("SELECT COUNT(*) AS n FROM questions WHERE quiz_id = ?").bind(quiz.id).first();
+  const status = n > 0 ? "ready" : "failed";
+  await env.DB.prepare("UPDATE quizzes SET status = ?, raw_text = '' WHERE id = ?").bind(status, quiz.id).run();
+  const api = tg(env);
+  if (status === "failed") {
+    const err = await env.DB.prepare("SELECT error FROM chunks WHERE quiz_id = ? AND error IS NOT NULL LIMIT 1").bind(quiz.id).first();
+    return api.send(quiz.owner_id,
+      `❌ Could not build <b>${esc(quiz.title)}</b>: no questions were recognised.${err ? `\nLast error: <code>${esc(err.error)}</code>` : ""}\nTry /retry ${quiz.code}`);
+  }
+  return api.send(quiz.owner_id, await readyMessage(env, quiz, n, quiz.chunks_failed));
+}
+
+async function readyMessage(env, quiz, count, failedParts) {
+  const link = await shareLink(env, quiz.code);
+  const { low } = await env.DB.prepare("SELECT COUNT(*) AS low FROM questions WHERE quiz_id = ? AND confidence = 'low'").bind(quiz.id).first();
+  let text = `✅ <b>${esc(quiz.title)}</b> is ready: <b>${count}</b> questions.\n\n🔗 Share this link to let anyone practise:\n${link}\n\nCode: <code>${quiz.code}</code> — /practice ${quiz.code}`;
+  if (low) text += `\n\n⚠️ The AI was unsure about ${low} answer(s). Check them with /export ${quiz.code} (look for "confidence": "low"), fix, and upload the JSON back.`;
+  if (failedParts) text += `\n\n⚠️ ${failedParts} part(s) failed to process. Use /retry ${quiz.code}.`;
+  return text;
+}
+
+function questionInserts(env, quizId, basePos, questions) {
+  return questions.map((q, i) =>
+    env.DB.prepare(
+      "INSERT INTO questions (quiz_id, position, question, options, correct, explanation, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ).bind(quizId, basePos + i, q.question, JSON.stringify(q.options), q.correct, q.explanation || null, q.confidence || null));
+}
+
+async function insertQuestions(env, quizId, basePos, questions) {
+  const stmts = questionInserts(env, quizId, basePos, questions);
+  for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
+}
+
+async function retryFailed(env, quiz, chat) {
+  const api = tg(env);
+  const { results } = await env.DB.prepare("SELECT idx FROM chunks WHERE quiz_id = ? AND status = 'failed'").bind(quiz.id).all();
+  if (!results.length) return api.send(chat, "No failed parts to retry.");
+  await env.DB.batch([
+    env.DB.prepare("UPDATE chunks SET status = 'pending' WHERE quiz_id = ? AND status = 'failed'").bind(quiz.id),
+    env.DB.prepare("UPDATE quizzes SET status = 'processing', chunks_failed = 0, chunks_done = chunks_total - ? WHERE id = ?").bind(results.length, quiz.id),
+  ]);
+  await env.QUIZ_QUEUE.sendBatch(results.map((r) => ({ body: { quizId: quiz.id, idx: r.idx } })));
+  return api.send(chat, `🔁 Retrying ${results.length} part(s) of <b>${esc(quiz.title)}</b>…`);
+}
+
+// ───────────────────────────── managing quizzes ─────────────────────────────
+
+let cachedUsername = null;
+async function shareLink(env, code) {
+  if (!cachedUsername) cachedUsername = env.BOT_USERNAME || (await tg(env).call("getMe")).username;
+  return `https://t.me/${cachedUsername}?start=q_${code}`;
+}
+
+const ownedQuiz = (env, uid, code) =>
+  code ? env.DB.prepare("SELECT * FROM quizzes WHERE code = ? AND owner_id = ?").bind(code.replace(/^q_/, ""), uid).first() : null;
+
+async function deleteQuiz(env, quizId) {
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM questions WHERE quiz_id = ?").bind(quizId),
+    env.DB.prepare("DELETE FROM chunks WHERE quiz_id = ?").bind(quizId),
+    env.DB.prepare("DELETE FROM sessions WHERE quiz_id = ?").bind(quizId),
+    env.DB.prepare("DELETE FROM drafts WHERE quiz_id = ?").bind(quizId),
+    env.DB.prepare("DELETE FROM quizzes WHERE id = ?").bind(quizId),
+  ]);
+}
+
+async function listQuizzes(env, uid, chat) {
+  const api = tg(env);
+  const { results } = await env.DB.prepare(
+    `SELECT q.*, (SELECT COUNT(*) FROM questions WHERE quiz_id = q.id) AS n
+     FROM quizzes q WHERE owner_id = ? ORDER BY id DESC LIMIT 30`,
+  ).bind(uid).all();
+  if (!results.length) return api.send(chat, "You have no quizzes yet. Start with /new <i>title</i>.");
+  const icon = { draft: "📝", processing: "⏳", ready: "✅", failed: "❌" };
+  const lines = [];
+  for (const q of results) {
+    let line = `${icon[q.status] || "•"} <b>${esc(q.title)}</b> — ${q.n} questions — <code>${q.code}</code>`;
+    if (q.status === "processing") line += ` (${q.chunks_done + q.chunks_failed}/${q.chunks_total} parts)`;
+    if (q.status === "ready") line += `\n    ${await shareLink(env, q.code)}`;
+    lines.push(line);
+  }
+  return api.send(chat, lines.join("\n"));
+}
+
+async function exportQuiz(env, uid, chat, code) {
+  const api = tg(env);
+  const quiz = await ownedQuiz(env, uid, code);
+  if (!quiz) return api.send(chat, "Usage: /export <i>code</i> (see /my)");
+  const { results } = await env.DB.prepare("SELECT * FROM questions WHERE quiz_id = ? ORDER BY position").bind(quiz.id).all();
+  const data = {
+    title: quiz.title,
+    questions: results.map((r) => ({
+      question: r.question,
+      options: JSON.parse(r.options),
+      correct: r.correct,
+      explanation: r.explanation || "",
+      confidence: r.confidence || "medium",
+    })),
+  };
+  const safe = quiz.title.replace(/[^\p{L}\p{N}_-]+/gu, "_").slice(0, 40) || "quiz";
+  return api.sendDocument(chat, `${safe}.json`, JSON.stringify(data, null, 2),
+    `${results.length} questions. "correct" is the 0-based index of the right option. Edit and send this file back to create a corrected quiz.`);
+}
+
+// ───────────────────────────── practice ─────────────────────────────
+
+async function offerQuiz(env, chat, code) {
+  const api = tg(env);
+  const quiz = await env.DB.prepare("SELECT * FROM quizzes WHERE code = ?").bind(code).first();
+  if (!quiz) return api.send(chat, "Quiz not found. Check the link or code.");
+  if (quiz.status !== "ready") return api.send(chat, "This quiz is still being prepared. Try again in a few minutes.");
+  const { n } = await env.DB.prepare("SELECT COUNT(*) AS n FROM questions WHERE quiz_id = ?").bind(quiz.id).first();
+  const sizes = [10, 20, 50].filter((s) => s < n);
+  const buttons = [...sizes.map((s) => ({ text: `${s}`, callback_data: `go:${code}:${s}` })), { text: `All ${n}`, callback_data: `go:${code}:0` }];
+  return api.send(chat, `📚 <b>${esc(quiz.title)}</b>\n${n} questions. How many do you want? (random order)`, {
+    reply_markup: { inline_keyboard: [buttons] },
+  });
+}
+
+async function onCallback(cb, env) {
+  const api = tg(env);
+  await api.call("answerCallbackQuery", { callback_query_id: cb.id }).catch(() => {});
+  const [kind, code, countStr] = (cb.data || "").split(":");
+  if (kind !== "go" || !cb.message) return;
+  const quiz = await env.DB.prepare("SELECT * FROM quizzes WHERE code = ? AND status = 'ready'").bind(code).first();
+  if (!quiz) return api.send(cb.message.chat.id, "Quiz not found.");
+  const { results } = await env.DB.prepare("SELECT id FROM questions WHERE quiz_id = ?").bind(quiz.id).all();
+  let order = shuffle(results.map((r) => r.id));
+  const count = Number(countStr);
+  if (count > 0) order = order.slice(0, count);
+
+  const session = { user_id: cb.from.id, chat_id: cb.message.chat.id, quiz_id: quiz.id, q_order: order, idx: 0, score: 0 };
+  await env.DB.prepare(
+    "INSERT OR REPLACE INTO sessions (user_id, chat_id, quiz_id, q_order, idx, score, poll_id, started_at) VALUES (?, ?, ?, ?, 0, 0, NULL, ?)",
+  ).bind(session.user_id, session.chat_id, quiz.id, JSON.stringify(order), now()).run();
+  await api.send(session.chat_id, `▶️ Starting <b>${esc(quiz.title)}</b>: ${order.length} questions. /stop to quit.`);
+  return sendCurrent(env, session);
+}
+
+async function sendCurrent(env, s) {
+  const api = tg(env);
+  const total = s.q_order.length;
+  if (s.idx >= total) {
+    await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(s.user_id).run();
+    const pct = Math.round((100 * s.score) / Math.max(total, 1));
+    const medal = pct >= 90 ? "🏆" : pct >= 70 ? "🎉" : pct >= 50 ? "👍" : "📖";
+    const quiz = await env.DB.prepare("SELECT code FROM quizzes WHERE id = ?").bind(s.quiz_id).first();
+    return api.send(s.chat_id, `${medal} Finished! Score: <b>${s.score}/${total}</b> (${pct}%).${quiz ? `\nTry again: /practice ${quiz.code}` : ""}`);
+  }
+  const row = await env.DB.prepare("SELECT * FROM questions WHERE id = ?").bind(s.q_order[s.idx]).first();
+  if (!row) { // question deleted meanwhile; skip it
+    s.idx++;
+    return sendCurrent(env, s);
+  }
+  const { preface, poll } = buildPoll({ ...row, options: JSON.parse(row.options) }, s.idx + 1, total);
+  if (preface) await api.send(s.chat_id, esc(preface));
+  const sent = await api.call("sendPoll", { chat_id: s.chat_id, ...poll });
+  await env.DB.prepare("UPDATE sessions SET poll_id = ?, idx = ?, score = ? WHERE user_id = ?")
+    .bind(sent.poll.id, s.idx, s.score, s.user_id).run();
+}
+
+async function onPollAnswer(ans, env) {
+  const uid = ans.user?.id;
+  if (!uid) return;
+  const row = await env.DB.prepare("SELECT * FROM sessions WHERE user_id = ? AND poll_id = ?").bind(uid, ans.poll_id).first();
+  if (!row) return; // old poll or session stopped
+  const s = { ...row, q_order: JSON.parse(row.q_order) };
+  const q = await env.DB.prepare("SELECT correct FROM questions WHERE id = ?").bind(s.q_order[s.idx]).first();
+  if (q && ans.option_ids?.[0] === q.correct) s.score++;
+  s.idx++;
+  // Claim this poll so a duplicate delivery can't advance twice.
+  const claimed = await env.DB.prepare("UPDATE sessions SET poll_id = NULL, idx = ?, score = ? WHERE user_id = ? AND poll_id = ?")
+    .bind(s.idx, s.score, uid, ans.poll_id).run();
+  if (!claimed.meta.changes) return;
+  return sendCurrent(env, s);
+}

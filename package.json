@@ -1,0 +1,15 @@
+{
+  "name": "quizbot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Telegram quiz bot: AI turns raw multiple-choice questions into Telegram quiz polls (Cloudflare Workers free tier)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "wrangler": "4.164.0"
+  }
+}
