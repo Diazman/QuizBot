@@ -28,6 +28,16 @@ if ! $WR queues info "$QUEUE" >/dev/null 2>&1; then $WR queues create "$QUEUE"; 
 echo "==> Database migrations"
 $WR d1 migrations apply "$DB_NAME" --remote -c wrangler.deploy.toml
 
+if [ "${DEPLOY_DEBUG:-}" = "debug" ]; then
+  echo "==> Probe: deploy a bare worker with no bindings"
+  if $WR deploy scripts/probe/index.js --name quizbot-probe --compatibility-date 2026-11-01 --no-bundle; then
+    echo "PROBE RESULT: bare worker deploy OK"
+    $WR delete --name quizbot-probe --force || true
+  else
+    echo "PROBE RESULT: bare worker deploy FAILED"
+  fi
+fi
+
 echo "==> Deploy worker"
 OUT=$(WRANGLER_LOG=${DEPLOY_DEBUG:-info} WRANGLER_LOG_SANITIZE=${DEPLOY_DEBUG_SANITIZE:-true} $WR deploy -c wrangler.deploy.toml 2>&1 | tee /dev/stderr)
 URL=$(echo "$OUT" | grep -oE 'https://[a-zA-Z0-9._-]+\.workers\.dev' | head -1)
