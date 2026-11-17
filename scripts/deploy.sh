@@ -29,7 +29,7 @@ echo "==> Database migrations"
 $WR d1 migrations apply "$DB_NAME" --remote -c wrangler.deploy.toml
 
 echo "==> Deploy worker"
-OUT=$(WRANGLER_LOG=${DEPLOY_DEBUG:-info} $WR deploy -c wrangler.deploy.toml 2>&1 | tee /dev/stderr)
+OUT=$(WRANGLER_LOG=${DEPLOY_DEBUG:-info} WRANGLER_LOG_SANITIZE=${DEPLOY_DEBUG_SANITIZE:-true} $WR deploy -c wrangler.deploy.toml 2>&1 | tee /dev/stderr)
 URL=$(echo "$OUT" | grep -oE 'https://[a-zA-Z0-9._-]+\.workers\.dev' | head -1)
 
 echo "==> Secrets"

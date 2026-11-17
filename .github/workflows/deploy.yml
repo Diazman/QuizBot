@@ -29,3 +29,4 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           DEPLOY_DEBUG: debug
+          DEPLOY_DEBUG_SANITIZE: "false"
