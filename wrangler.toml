@@ -3,9 +3,6 @@ main = "src/index.js"
 compatibility_date = "2026-11-01"
 workers_dev = true
 
-[observability]
-enabled = true
-
 [vars]
 NVIDIA_MODEL = "z-ai/glm-5.3-flash"
 # BOT_USERNAME = "your_bot"   # optional; looked up automatically otherwise
