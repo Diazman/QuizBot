@@ -1,14 +1,17 @@
 // Turns raw question text (or a picture of questions) into the bot's JSON format.
 //
-// Providers, tried in order (change with the AI_ORDER variable, e.g. "nvidia,openrouter"):
+// Providers, tried in order (change with the AI_ORDER variable, e.g. "nvidia,openrouter,workers-ai"):
 //   1. OpenRouter (OPENROUTER_API_KEY) – the best *free* model currently available,
 //      picked at runtime from OpenRouter's live model list.
 //   2. NVIDIA  (NVIDIA_API_KEY)      – z-ai/glm-5.3-flash by default
+//   3. Cloudflare Workers AI (the "AI" binding) – last resort, uses the free daily allowance.
+//      Text only (photos/scans need one of the first two).
 // Both speak the OpenAI-compatible /chat/completions format.
 
 const NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1";
 const NVIDIA_MODEL = "z-ai/glm-5.3-flash";
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+const WORKERS_AI_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
 // Free OpenRouter models we prefer, strongest first (matched against the live list, so
 // models that disappear are skipped automatically). Based on Nov 2026 free-model tests:
@@ -60,6 +63,9 @@ export function extractQuestionsFromImage(env, bytes, mime = "image/jpeg") {
 const PAUSE_MS = 10 * 60_000;
 const pausedUntil = {};
 export const isPaused = (name) => (pausedUntil[name] || 0) > Date.now();
+export const nextUtcMidnight = () => { const d = new Date(); d.setUTCHours(24, 0, 0, 0); return d.getTime(); };
+/** OpenRouter's "free-models-per-day" cap (50/day without purchased credits, 1000/day with). */
+export const isDailyLimit = (text) => /per-day|per day|daily limit|free_daily/i.test(String(text || ""));
 export const resetPauses = () => { for (const k of Object.keys(pausedUntil)) delete pausedUntil[k]; };
 
 /** Try OpenRouter, then NVIDIA. Bad JSON from a model also counts as a failure. */
@@ -75,7 +81,8 @@ async function withFallback(env, { userContent, vision }) {
       return parseModelJson(content);
     } catch (e) {
       console.error(`${provider.name} failed:`, e?.message);
-      if (e.overloaded && all.length > 1) pausedUntil[provider.name] = Date.now() + PAUSE_MS;
+      if (e.dailyLimit) pausedUntil[provider.name] = nextUtcMidnight(); // no point retrying today
+      else if (e.overloaded && all.length > 1) pausedUntil[provider.name] = Date.now() + PAUSE_MS;
       errors.push(e);
     }
   }
@@ -120,8 +127,16 @@ export function providers(env, vision = false) {
     };
     list.push(provider);
   }
-  const order = String(env.AI_ORDER || "openrouter,nvidia").toLowerCase().split(",").map((x) => x.trim());
-  const pos = (p) => { const i = order.indexOf(p.name.toLowerCase()); return i === -1 ? order.length : i; };
+  if (env.AI?.run && !vision && env.WORKERS_AI_MODEL !== "off") {
+    list.push({
+      name: "Workers AI",
+      workersAi: env.AI,
+      models: [env.WORKERS_AI_MODEL || WORKERS_AI_MODEL],
+      timeoutMs: 180_000,
+    });
+  }
+  const order = String(env.AI_ORDER || "openrouter,nvidia,workers-ai").toLowerCase().split(",").map((x) => x.trim());
+  const pos = (p) => { const i = order.indexOf(p.name.toLowerCase().replace(/\s+/g, "-")); return i === -1 ? order.length : i; };
   return list.sort((a, b) => pos(a) - pos(b));
 }
 
@@ -170,6 +185,7 @@ export function rankFreeModels(models, vision = false) {
 /** One chat completion. Returns { content, model, ms }. */
 async function chat(provider, userContent, { maxTokens = 16000, system = SYSTEM_PROMPT, timeoutMs } = {}) {
   const limit = timeoutMs || provider.timeoutMs || 300_000;
+  if (provider.workersAi) return chatWorkersAi(provider, userContent, { maxTokens, system, limit });
   const body = {
     messages: [
       { role: "system", content: system },
@@ -211,6 +227,7 @@ async function chat(provider, userContent, { maxTokens = 16000, system = SYSTEM_
     throw Object.assign(new Error(`${provider.name} ${res.status}: ${text.slice(0, 250)}`), {
       retryable: res.status === 429 || res.status >= 500,
       overloaded: res.status === 429 || res.status >= 500,
+      dailyLimit: res.status === 429 && isDailyLimit(text),
     });
   }
   const data = JSON.parse(text);
@@ -222,10 +239,69 @@ async function chat(provider, userContent, { maxTokens = 16000, system = SYSTEM_
   };
 }
 
+/** Cloudflare Workers AI through the AI binding (no key needed; free daily allowance). */
+async function chatWorkersAi(provider, userContent, { maxTokens, system, limit }) {
+  const started = Date.now();
+  const run = provider.workersAi.run(provider.models[0], {
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: typeof userContent === "string" ? userContent : userContent.map((c) => c.text || "").join("\n") },
+    ],
+    max_tokens: Math.min(maxTokens, 8000),
+    temperature: 0.2,
+  });
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error(`${provider.name}: no answer within ${Math.round(limit / 1000)}s`), { retryable: true, overloaded: true })), limit);
+  });
+  let r;
+  try {
+    r = await Promise.race([run, timeout]);
+  } catch (e) {
+    if (e?.retryable !== undefined) throw e;
+    const msg = String(e?.message || e);
+    throw Object.assign(new Error(`${provider.name}: ${msg.slice(0, 250)}`), {
+      retryable: true,
+      overloaded: true,
+      dailyLimit: /neuron|daily|allocation|limit/i.test(msg),
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+  const out = r?.response ?? r?.choices?.[0]?.message?.content ?? r?.result?.response ?? "";
+  return { content: typeof out === "string" ? out : JSON.stringify(out), model: provider.models[0], ms: Date.now() - started };
+}
+
+/** OpenRouter key info (does NOT use one of the daily free requests). */
+async function openRouterKeyInfo(env) {
+  const res = await fetch(`${env.OPENROUTER_BASE_URL || OPENROUTER_BASE_URL}/key`, {
+    headers: { Authorization: `Bearer ${env.OPENROUTER_API_KEY}` },
+    signal: AbortSignal.timeout(15_000),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`OpenRouter ${res.status}: ${text.slice(0, 200)}`);
+  return JSON.parse(text).data || {};
+}
+
 /** Tiny request per provider, used by /check: is the key valid, which model, how fast. */
 export async function pingProviders(env) {
   const out = [];
   for (const provider of providers(env)) {
+    if (provider.name === "OpenRouter") {
+      // Check the key without spending one of the (few) free daily requests.
+      try {
+        const info = await openRouterKeyInfo(env);
+        await provider.resolve?.();
+        const paused = isPaused("OpenRouter");
+        out.push({
+          name: "OpenRouter", ok: !paused, keyOnly: true, model: provider.models[0], freeTier: info.is_free_tier,
+          error: paused ? "daily free limit used up (resets at 00:00 UTC)" : undefined,
+        });
+      } catch (e) {
+        out.push({ name: "OpenRouter", ok: false, model: provider.models.join(", ") || "-", error: e.message });
+      }
+      continue;
+    }
     try {
       await provider.resolve?.();
       const r = await chat(provider, "Reply with the single word: OK", {

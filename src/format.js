@@ -10,7 +10,7 @@ const QUESTION_START = /^\s*(?:\d{1,4}\s*[.)\]:]|вопрос\b|question\b|№\s
  * looks like the start of a new question, or at a blank line as a fallback,
  * so a question is never split between two AI calls.
  */
-export function splitIntoChunks(text, maxChars = 6000) {
+export function splitIntoChunks(text, maxChars = 10000) {
   const lines = String(text).replace(/\r\n?/g, "\n").split("\n");
   const chunks = [];
   let cur = [];

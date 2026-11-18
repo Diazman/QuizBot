@@ -92,3 +92,28 @@ test("isOverloadError recognises busy/timeout errors", async () => {
   assert.ok(isOverloadError("OpenRouter 429: rate limited | NVIDIA: no answer within 120s"));
   assert.ok(!isOverloadError("NVIDIA 401: invalid key"));
 });
+
+test("OpenRouter daily limit: skipped until midnight, NVIDIA used", async () => {
+  const { isPaused } = await import("../src/ai.js");
+  const daily = () => new Response('{"error":{"message":"Rate limit exceeded: free-models-per-day. Add 10 credits","code":429}}', { status: 429 });
+  mockFetch(() => new Response(GOOD), daily);
+  assert.equal((await extractQuestions(env, "t")).length, 1);
+  assert.ok(isPaused("OpenRouter"));
+});
+
+test("Workers AI is the last resort when both others fail", async () => {
+  mockFetch(() => new Response("down", { status: 503 }), () => new Response("busy", { status: 429 }));
+  let ran = null;
+  const AI = { run: async (model, input) => { ran = { model, input }; return { response: '{"questions":[{"question":"q","options":["a","b"],"correct":0}]}' }; } };
+  const q = await extractQuestions({ ...env, AI }, "text");
+  assert.equal(q[0].correct, 0);
+  assert.equal(ran.model, "@cf/meta/llama-3.3-70b-instruct-fp8-fast");
+  assert.equal(ran.input.messages[1].content, "Questions:\n\ntext");
+});
+
+test("Workers AI is not used for photos (text-only model)", async () => {
+  const { extractQuestionsFromImage } = await import("../src/ai.js");
+  mockFetch(() => new Response("down", { status: 503 }), () => new Response("busy", { status: 429 }));
+  const AI = { run: async () => { throw new Error("should not be called for images"); } };
+  await assert.rejects(extractQuestionsFromImage({ ...env, AI }, new Uint8Array([0xff, 0xd8])), /429|503/);
+});

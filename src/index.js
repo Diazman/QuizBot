@@ -2,7 +2,7 @@
 //  fetch: Telegram webhook (commands, uploads, poll answers)
 //  queue: AI processing of question chunks (runs in the background, retried on failure)
 
-import { extractQuestions, extractQuestionsFromImage, isOverloadError, pingProviders } from "./ai.js";
+import { extractQuestions, extractQuestionsFromImage, isDailyLimit, isOverloadError, pingProviders } from "./ai.js";
 import { buildPoll, countImages, imageMarker, normalizeQuestion, parseImageMarker, parseQuizJson, planChunks, randomCode, shuffle } from "./format.js";
 import { fileToText, pdfJpegImages } from "./files.js";
 import { esc, tg, webhookSecret } from "./telegram.js";
@@ -207,15 +207,19 @@ async function runCheck(env, chat, uid, code) {
   const pings = await pingProviders(env);
   if (!pings.length) lines.push("❌ No AI is configured: add NVIDIA_API_KEY and/or OPENROUTER_API_KEY as Secrets in Cloudflare.");
   for (const p of pings) {
-    if (p.ok) {
+    if (p.keyOnly && p.ok) {
+      lines.push(`✅ OpenRouter key works; model <code>${esc(p.model)}</code>${p.freeTier ? " (free tier: 50 free requests/day; buy $10 credits once for 1000/day)" : ""}`);
+    } else if (p.ok) {
       const said = String(p.content).replace(/<think>[\s\S]*?<\/think>/g, "").trim().slice(0, 30);
       lines.push(`✅ ${p.name} <code>${esc(p.model)}</code> answered in ${(p.ms / 1000).toFixed(1)}s: "${esc(said)}"`);
       if (p.ms > 15000) lines.push(`⚠️ ${p.name} is slow right now; each part of a quiz can take minutes.`);
     } else {
-      lines.push(`❌ ${p.name} (<code>${esc(p.model)}</code>): ${esc(p.error).slice(0, 250)}`);
+      lines.push(isDailyLimit(p.error)
+        ? `❌ ${p.name}: today's free limit is used up (resets at 00:00 UTC).`
+        : `❌ ${p.name} (<code>${esc(p.model)}</code>): ${esc(p.error).slice(0, 250)}`);
     }
   }
-  if (pings.length > 1) lines.push(`ℹ️ ${pings[0].name} is used first; ${pings[1].name} is the backup.`);
+  if (pings.length > 1) lines.push(`ℹ️ Order: ${pings.map((p) => p.name).join(" → ")}. If one fails, the next is used.`);
 
   if (code) {
     const quiz = await ownedQuiz(env, uid, code);
@@ -539,6 +543,10 @@ async function maybeFinish(env, quiz) {
   const api = tg(env);
   if (status === "failed") {
     const err = await env.DB.prepare("SELECT error FROM chunks WHERE quiz_id = ? AND error IS NOT NULL LIMIT 1").bind(quiz.id).first();
+    if (err && isDailyLimit(err.error)) {
+      return api.send(quiz.owner_id,
+        `😔 The free AI's daily limit is used up, so <b>${esc(quiz.title)}</b> couldn't be processed.\nIt resets at 00:00 UTC; then use /retry ${quiz.code}.\n(Adding $10 of OpenRouter credits once raises the limit from 50 to 1000 requests a day.)`);
+    }
     if (err && isOverloadError(err.error)) {
       return api.send(quiz.owner_id,
         `😔 The AI is overloaded right now, so <b>${esc(quiz.title)}</b> couldn't be processed.\nPlease try again in a few minutes: /retry ${quiz.code}`);
