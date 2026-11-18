@@ -117,3 +117,57 @@ test("Workers AI is not used for photos (text-only model)", async () => {
   const AI = { run: async () => { throw new Error("should not be called for images"); } };
   await assert.rejects(extractQuestionsFromImage({ ...env, AI }, new Uint8Array([0xff, 0xd8])), /429|503/);
 });
+
+// ── Gemini ──
+function mockAll({ gemini, openrouter = () => new Response(GOOD), nvidia = () => new Response(GOOD) }) {
+  calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    calls.push({ url: String(url), body, auth: init.headers?.Authorization });
+    if (String(url).endsWith("/models")) return new Response(JSON.stringify({ data: MODELS }));
+    if (String(url).includes("generativelanguage")) return gemini(body);
+    if (String(url).includes("nvidia")) return nvidia();
+    return openrouter();
+  };
+}
+const genv = { ...env, GOOGLE_AI_KEY: "g" };
+
+test("Gemini is used first, with the flash-latest alias and Bearer key", async () => {
+  const { providers } = await import("../src/ai.js");
+  mockAll({ gemini: () => new Response(GOOD), openrouter: () => { throw new Error("no"); } });
+  assert.equal((await extractQuestions(genv, "t")).length, 1);
+  const g = calls.find((c) => c.url.includes("generativelanguage"));
+  assert.equal(g.url, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
+  assert.equal(g.body.model, "gemini-flash-latest");
+  assert.equal(g.auth, "Bearer g");
+  assert.deepEqual(providers(genv).map((p) => p.name), ["Gemini", "OpenRouter", "NVIDIA"]);
+});
+
+test("Gemini: unknown model name -> next name, other providers untouched", async () => {
+  mockAll({
+    gemini: (b) => b.model === "gemini-flash-latest"
+      ? new Response('{"error":{"message":"models/gemini-flash-latest is not found"}}', { status: 404 })
+      : new Response(GOOD),
+    openrouter: () => { throw new Error("no"); },
+  });
+  assert.equal((await extractQuestions({ ...genv, GEMINI_MODEL: undefined }, "t")).length, 1);
+  assert.deepEqual(calls.filter((c) => c.url.includes("generativelanguage")).map((c) => c.body.model), ["gemini-flash-latest", "gemini-3.5-flash"]);
+});
+
+test("Gemini daily quota -> skipped until midnight, OpenRouter used", async () => {
+  const { isPaused } = await import("../src/ai.js");
+  mockAll({
+    gemini: () => new Response('{"error":{"code":429,"message":"Quota exceeded ... quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier"}}', { status: 429 }),
+  });
+  assert.equal((await extractQuestions({ ...genv, GEMINI_MODEL: "gemini-x" }, "t")).length, 1);
+  assert.ok(isPaused("Gemini"));
+  assert.ok(calls.some((c) => c.url.includes("openrouter.ai/api/v1/chat")));
+});
+
+test("photos go to Gemini as an image", async () => {
+  const { extractQuestionsFromImage } = await import("../src/ai.js");
+  mockAll({ gemini: () => new Response(GOOD) });
+  await extractQuestionsFromImage({ ...genv, GEMINI_MODEL: "gemini-x" }, new Uint8Array([0xff, 0xd8, 1]));
+  const g = calls.find((c) => c.url.includes("generativelanguage"));
+  assert.ok(g.body.messages[1].content.some((p) => p.type === "image_url" && p.image_url.url.startsWith("data:image/jpeg;base64,")));
+});

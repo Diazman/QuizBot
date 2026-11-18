@@ -1,6 +1,7 @@
 // Turns raw question text (or a picture of questions) into the bot's JSON format.
 //
-// Providers, tried in order (change with the AI_ORDER variable, e.g. "nvidia,openrouter,workers-ai"):
+// Providers, tried in order (change with the AI_ORDER variable, e.g. "openrouter,gemini,nvidia,workers-ai"):
+//   0. Google Gemini (GOOGLE_AI_KEY or GEMINI_API_KEY) – free tier, reads images too
 //   1. OpenRouter (OPENROUTER_API_KEY) – the best *free* model currently available,
 //      picked at runtime from OpenRouter's live model list.
 //   2. NVIDIA  (NVIDIA_API_KEY)      – z-ai/glm-5.3-flash by default
@@ -12,6 +13,11 @@ const NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1";
 const NVIDIA_MODEL = "z-ai/glm-5.3-flash";
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 const WORKERS_AI_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
+// "gemini-flash-latest" is Google's alias for its current Flash model; the others are
+// tried only if Google rejects the alias.
+const GEMINI_MODELS = ["gemini-flash-latest", "gemini-3.5-flash", "gemini-2.5-flash"];
+let geminiWorkingModel = null; // remembered after the first success
 
 // Free OpenRouter models we prefer, strongest first (matched against the live list, so
 // models that disappear are skipped automatically). Based on Nov 2026 free-model tests:
@@ -65,7 +71,7 @@ const pausedUntil = {};
 export const isPaused = (name) => (pausedUntil[name] || 0) > Date.now();
 export const nextUtcMidnight = () => { const d = new Date(); d.setUTCHours(24, 0, 0, 0); return d.getTime(); };
 /** OpenRouter's "free-models-per-day" cap (50/day without purchased credits, 1000/day with). */
-export const isDailyLimit = (text) => /per-day|per day|daily limit|free_daily/i.test(String(text || ""));
+export const isDailyLimit = (text) => /per-day|per day|perday|daily limit|free_daily/i.test(String(text || ""));
 export const resetPauses = () => { for (const k of Object.keys(pausedUntil)) delete pausedUntil[k]; };
 
 /** Try OpenRouter, then NVIDIA. Bad JSON from a model also counts as a failure. */
@@ -96,6 +102,20 @@ async function withFallback(env, { userContent, vision }) {
 /** The providers to try, in order. OpenRouter's model list is only fetched if it's actually needed. */
 export function providers(env, vision = false) {
   const list = [];
+  const googleKey = env.GOOGLE_AI_KEY || env.GEMINI_API_KEY;
+  if (googleKey) {
+    // The name that worked last time goes first, but the others stay as fallbacks.
+    const models = env.GEMINI_MODEL ? [env.GEMINI_MODEL] : [...new Set([geminiWorkingModel, ...GEMINI_MODELS].filter(Boolean))];
+    list.push({
+      name: "Gemini",
+      baseUrl: env.GEMINI_BASE_URL || GEMINI_BASE_URL,
+      key: googleKey,
+      models,
+      sequentialModels: true, // try the next name only if Google says the model doesn't exist
+      onModelWorked: (m) => { if (!env.GEMINI_MODEL) geminiWorkingModel = m; },
+      timeoutMs: Number(env.GEMINI_TIMEOUT_MS) || 180_000,
+    });
+  }
   if (env.NVIDIA_API_KEY) {
     list.push({
       name: "NVIDIA",
@@ -135,7 +155,7 @@ export function providers(env, vision = false) {
       timeoutMs: 180_000,
     });
   }
-  const order = String(env.AI_ORDER || "openrouter,nvidia,workers-ai").toLowerCase().split(",").map((x) => x.trim());
+  const order = String(env.AI_ORDER || "gemini,openrouter,nvidia,workers-ai").toLowerCase().split(",").map((x) => x.trim());
   const pos = (p) => { const i = order.indexOf(p.name.toLowerCase().replace(/\s+/g, "-")); return i === -1 ? order.length : i; };
   return list.sort((a, b) => pos(a) - pos(b));
 }
@@ -186,6 +206,18 @@ export function rankFreeModels(models, vision = false) {
 async function chat(provider, userContent, { maxTokens = 16000, system = SYSTEM_PROMPT, timeoutMs } = {}) {
   const limit = timeoutMs || provider.timeoutMs || 300_000;
   if (provider.workersAi) return chatWorkersAi(provider, userContent, { maxTokens, system, limit });
+  if (provider.sequentialModels && provider.models.length > 1) {
+    let lastErr;
+    for (const m of provider.models) {
+      try {
+        return await chat({ ...provider, models: [m], sequentialModels: false }, userContent, { maxTokens, system, timeoutMs });
+      } catch (e) {
+        lastErr = e;
+        if (!e.modelMissing) throw e;
+      }
+    }
+    throw lastErr;
+  }
   const body = {
     messages: [
       { role: "system", content: system },
@@ -228,10 +260,12 @@ async function chat(provider, userContent, { maxTokens = 16000, system = SYSTEM_
       retryable: res.status === 429 || res.status >= 500,
       overloaded: res.status === 429 || res.status >= 500,
       dailyLimit: res.status === 429 && isDailyLimit(text),
+      modelMissing: res.status === 404 || (res.status === 400 && /model/i.test(text) && /not found|not supported|invalid|unknown/i.test(text)),
     });
   }
   const data = JSON.parse(text);
   if (data?.error) throw Object.assign(new Error(`${provider.name}: ${JSON.stringify(data.error).slice(0, 250)}`), { retryable: true });
+  provider.onModelWorked?.(provider.models[0]);
   return {
     content: data?.choices?.[0]?.message?.content ?? "",
     model: data?.model || provider.models[0],

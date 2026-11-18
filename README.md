@@ -65,7 +65,8 @@ Every push to `main` now redeploys the bot automatically.
 ### 4. Add the keys
 Open the **quizbot** worker and go to **Settings → Variables and Secrets**. Add these two entries with type **Secret**:
 - `TELEGRAM_BOT_TOKEN`: the BotFather token
-- `OPENROUTER_API_KEY`: the main AI. The bot uses the strongest **free** OpenRouter model available at that moment. It looks up OpenRouter's live model list, prefers Nemotron 3.5 Super VL, and sends up to 3 models so OpenRouter can switch between them when one is busy.
+- `GOOGLE_AI_KEY` (or `GEMINI_API_KEY`): **Google Gemini** free tier, from aistudio.google.com. This is the main AI. It's strong at Russian and reads photos and scans. The bot uses the `gemini-flash-latest` alias and falls back to `gemini-3.5-flash`, then `gemini-2.5-flash`, if Google rejects it.
+- `OPENROUTER_API_KEY`: the second AI. The bot uses the strongest **free** OpenRouter model available at that moment. It looks up OpenRouter's live model list, prefers Nemotron 3.5 Super VL, and sends up to 3 models so OpenRouter can switch between them when one is busy.
 - `NVIDIA_API_KEY`: the backup AI (`z-ai/glm-5.3-flash`), used when OpenRouter fails.
 
 The last resort is **Cloudflare Workers AI** (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`). It needs no key and uses Cloudflare's free daily allowance. It handles text only; photos and scans need OpenRouter or NVIDIA. If every AI fails, the bot says the AI is overloaded and to try again later with `/retry`.
@@ -102,7 +103,8 @@ Telegram ──webhook──▶ Worker (fetch) ──▶ D1: quizzes, questions,
 
 In `wrangler.toml` under `[vars]`:
 - `NVIDIA_MODEL`: defaults to `z-ai/glm-5.3-flash`
-- `AI_ORDER`: optional; defaults to `openrouter,nvidia,workers-ai`.
+- `AI_ORDER`: optional; defaults to `gemini,openrouter,nvidia,workers-ai`.
+- `GEMINI_MODEL`: optional; pins one Gemini model name.
 - `WORKERS_AI_MODEL`: optional; another Workers AI text model, or `off` to disable this fallback.
 - `OPENROUTER_MODEL`: optional; pins one OpenRouter model instead of picking the best free one automatically
 - `BOT_USERNAME`: optional; the bot looks it up itself if you leave it out
