@@ -13,7 +13,8 @@ const now = () => Math.floor(Date.now() / 1000);
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (request.method === "GET" && url.pathname === "/") return new Response("QuizBot is running.");
+    if (request.method === "GET" && url.pathname === "/") return new Response("QuizBot is running. Open /setup once to connect Telegram.");
+    if (request.method === "GET" && url.pathname === "/setup") return setup(env, url.origin);
     if (request.method !== "POST" || url.pathname !== "/webhook") return new Response("Not found", { status: 404 });
 
     const secret = await webhookSecret(env.TELEGRAM_BOT_TOKEN);
@@ -49,6 +50,37 @@ export default {
     }
   },
 };
+
+// Points the Telegram webhook at this worker and registers the command menu.
+// Safe to call any time: it can only ever point the bot at this same worker.
+async function setup(env, origin) {
+  const text = (msg, status = 200) => new Response(msg, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
+  if (!env.TELEGRAM_BOT_TOKEN) return text("TELEGRAM_BOT_TOKEN secret is missing. Add it in Cloudflare: Worker → Settings → Variables and Secrets.", 500);
+  if (!env.NVIDIA_API_KEY) return text("NVIDIA_API_KEY secret is missing. Add it in Cloudflare: Worker → Settings → Variables and Secrets.", 500);
+  try {
+    const api = tg(env);
+    await api.call("setWebhook", {
+      url: `${origin}/webhook`,
+      secret_token: await webhookSecret(env.TELEGRAM_BOT_TOKEN),
+      allowed_updates: ["message", "callback_query", "poll_answer"],
+    });
+    await api.call("setMyCommands", {
+      commands: [
+        { command: "new", description: "Create a new quiz" },
+        { command: "done", description: "Finish uploading and let the AI build the quiz" },
+        { command: "my", description: "My quizzes and share links" },
+        { command: "practice", description: "Practise a quiz by code" },
+        { command: "export", description: "Download a quiz as JSON" },
+        { command: "stop", description: "Stop the current quiz" },
+        { command: "help", description: "How it works" },
+      ],
+    });
+    const me = await api.call("getMe");
+    return text(`✅ Telegram is connected.\nOpen https://t.me/${me.username} and send /start`);
+  } catch (e) {
+    return text(`❌ ${e.message}`, 500);
+  }
+}
 
 // ───────────────────────────── updates ─────────────────────────────
 

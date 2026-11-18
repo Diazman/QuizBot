@@ -1,9 +1,9 @@
 name: Deploy to Cloudflare
 
 # GitHub Actions is used only to deploy. The bot itself runs on Cloudflare Workers.
+# Manual only: the bot is deployed by Cloudflare Workers Builds (connected to this repo).
+# Run this from the Actions tab only if you deploy with an API token instead.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -22,11 +22,8 @@ jobs:
       - run: npm test
       - name: Deploy
         run: bash scripts/deploy.sh
-        # set to "debug" to see full Cloudflare API errors (secrets stay masked)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          DEPLOY_DEBUG: debug
-          DEPLOY_DEBUG_SANITIZE: "false"

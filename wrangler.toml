@@ -10,7 +10,7 @@ NVIDIA_MODEL = "z-ai/glm-5.3-flash"
 [[d1_databases]]
 binding = "DB"
 database_name = "quizbot-db"
-database_id = "REPLACE_WITH_D1_ID"   # filled in automatically by scripts/deploy.sh
+database_id = "c457df4e-305b-4d1f-96b1-e0f146e1c81a"
 migrations_dir = "migrations"
 
 [[queues.producers]]

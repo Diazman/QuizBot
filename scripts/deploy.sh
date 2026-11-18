@@ -20,7 +20,7 @@ if [ -z "$DB_ID" ]; then
   DB_ID=$($WR d1 list --json | node -e 'const l=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(l.find(x=>x.name===process.argv[1]).uuid)' "$DB_NAME")
 fi
 echo "    $DB_NAME = $DB_ID"
-sed "s/REPLACE_WITH_D1_ID/$DB_ID/" wrangler.toml > wrangler.deploy.toml
+sed -E "s/^database_id = .*/database_id = \"$DB_ID\"/" wrangler.toml > wrangler.deploy.toml
 
 echo "==> Queue"
 if ! $WR queues info "$QUEUE" >/dev/null 2>&1; then $WR queues create "$QUEUE"; fi
