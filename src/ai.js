@@ -22,7 +22,26 @@ Answer with JSON only, no markdown fences, exactly in this shape:
  * @param {string} text raw chunk of questions
  * @returns {Promise<Array<{question:string,options:string[],correct:number,explanation?:string,confidence?:string}>>}
  */
-export async function extractQuestions(env, text) {
+export function extractQuestions(env, text) {
+  return chat(env, env.NVIDIA_MODEL || DEFAULT_MODEL, `Questions:\n\n${text}`);
+}
+
+/**
+ * Same as extractQuestions, but the questions are in a picture (photo or scanned page).
+ * Uses the NVIDIA model's built-in vision (GLM-5.3 Flash is multimodal).
+ */
+export function extractQuestionsFromImage(env, bytes, mime = "image/jpeg") {
+  const url = `data:${mime};base64,${toBase64(bytes)}`;
+  return chat(env, env.NVIDIA_VISION_MODEL || env.NVIDIA_MODEL || DEFAULT_MODEL, [
+    {
+      type: "text",
+      text: "The attached image is a photo or scan of a page with multiple-choice questions. Read ALL the text on it carefully (it is usually Russian; marks like ticks, circles, underlines or highlighted options may show the right answer). Then extract the questions as instructed.",
+    },
+    { type: "image_url", image_url: { url } },
+  ]);
+}
+
+async function chat(env, model, userContent) {
   if (!env.NVIDIA_API_KEY) throw new Error("NVIDIA_API_KEY secret is not set");
   const baseUrl = (env.NVIDIA_BASE_URL || DEFAULT_BASE_URL).replace(/\/+$/, "");
   const res = await fetch(`${baseUrl}/chat/completions`, {
@@ -33,10 +52,10 @@ export async function extractQuestions(env, text) {
       Accept: "application/json",
     },
     body: JSON.stringify({
-      model: env.NVIDIA_MODEL || DEFAULT_MODEL,
+      model,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: `Questions:\n\n${text}` },
+        { role: "user", content: userContent },
       ],
       temperature: 0.2,
       top_p: 0.9,
@@ -48,13 +67,21 @@ export async function extractQuestions(env, text) {
   const body = await res.text();
   if (!res.ok) {
     const err = new Error(`NVIDIA API ${res.status}: ${body.slice(0, 300)}`);
-    // 429 / 5xx are worth retrying; 4xx (bad key, bad model) are not.
+    // 429 / 5xx are worth retrying; 4xx (bad key, bad model, image too big) are not.
     err.retryable = res.status === 429 || res.status >= 500;
     throw err;
   }
   const data = JSON.parse(body);
   const content = data?.choices?.[0]?.message?.content ?? "";
   return parseModelJson(content);
+}
+
+/** Base64-encode bytes (native toBase64 when the runtime has it — much cheaper on CPU). */
+export function toBase64(bytes) {
+  if (typeof bytes.toBase64 === "function") return bytes.toBase64();
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
 }
 
 /** Pull the JSON object out of a model reply (tolerates <think> blocks and ``` fences). */

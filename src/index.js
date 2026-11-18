@@ -2,9 +2,9 @@
 //  fetch: Telegram webhook (commands, uploads, poll answers)
 //  queue: AI processing of question chunks (runs in the background, retried on failure)
 
-import { extractQuestions } from "./ai.js";
-import { buildPoll, normalizeQuestion, parseQuizJson, randomCode, shuffle, splitIntoChunks } from "./format.js";
-import { fileToText } from "./files.js";
+import { extractQuestions, extractQuestionsFromImage } from "./ai.js";
+import { buildPoll, countImages, imageMarker, normalizeQuestion, parseImageMarker, parseQuizJson, planChunks, randomCode, shuffle } from "./format.js";
+import { fileToText, pdfJpegImages } from "./files.js";
 import { esc, tg, webhookSecret } from "./telegram.js";
 
 const MAX_DRAFT_CHARS = 400_000;
@@ -92,6 +92,7 @@ async function handleUpdate(update, env) {
   if (msg.chat.type !== "private") return; // practice & uploads happen in private chat
 
   const api = tg(env);
+  if (msg.photo) return onPhoto(msg, env);
   if (msg.document) return onDocument(msg, env);
 
   const text = (msg.text || "").trim();
@@ -115,7 +116,7 @@ async function handleUpdate(update, env) {
       const quiz = await createQuiz(env, uid, title);
       await env.DB.prepare("INSERT OR REPLACE INTO drafts (user_id, quiz_id) VALUES (?, ?)").bind(uid, quiz.id).run();
       return api.send(chat,
-        `📝 New quiz <b>${esc(title)}</b>.\n\nNow send me the questions: paste them as messages (as many as you need) and/or upload <b>PDF</b> / <b>.docx</b> / <b>.txt</b> files.\nWhen everything is sent, type /done.`);
+        `📝 New quiz <b>${esc(title)}</b>.\n\nNow send me the questions: paste them as messages (as many as you need) and/or upload <b>PDF</b> / <b>.docx</b> / <b>.txt</b> files and <b>photos</b> of test pages.\nWhen everything is sent, type /done.`);
     }
     case "/done": {
       const draft = await getDraft(env, uid);
@@ -165,7 +166,7 @@ const HELP = `🇷🇺 <b>Russian Quiz Bot</b>
 
 <b>Create a quiz</b>
 1. /new <i>title</i>
-2. Send your questions (paste text or upload PDF / .docx / .txt). Any format works — numbered questions with A/B/C/D options are perfect. If you already marked answers (e.g. "Ответ: Б" or bold), the AI uses them; otherwise it solves the questions itself.
+2. Send your questions (paste text, upload PDF / .docx / .txt, or send photos of the pages). Any format works — numbered questions with A/B/C/D options are perfect. If you already marked answers (e.g. "Ответ: Б" or bold), the AI uses them; otherwise it solves the questions itself.
 3. /done — the AI finds the correct answers and builds the quiz polls.
 Tip: you can also just upload a file without /new — it becomes a quiz straight away.
 
@@ -204,14 +205,51 @@ async function appendToDraft(env, draft, text) {
   return row.n;
 }
 
+/** The user's open draft, or a new one (pictures always go to a draft so albums stay together). */
+async function ensureDraft(env, uid, title) {
+  const draft = await getDraft(env, uid);
+  if (draft) return { draft, created: false };
+  const quiz = await createQuiz(env, uid, title);
+  await env.DB.prepare("INSERT OR REPLACE INTO drafts (user_id, quiz_id) VALUES (?, ?)").bind(uid, quiz.id).run();
+  return { draft: quiz, created: true };
+}
+
+function draftStatus(raw) {
+  const pics = countImages(raw);
+  const chars = raw.replace(/\[\[img:[^\]]+\]\]/g, "").trim().length;
+  const parts = [];
+  if (chars) parts.push(`${chars.toLocaleString("en")} characters`);
+  if (pics) parts.push(`${pics} picture${pics === 1 ? "" : "s"}`);
+  return parts.join(" + ") || "empty";
+}
+
+async function addPicturesToDraft(env, msg, markers, what) {
+  const api = tg(env);
+  const title = (msg.caption || `Quiz ${new Date().toISOString().slice(0, 10)}`).trim();
+  const { draft, created } = await ensureDraft(env, msg.from.id, title);
+  await appendToDraft(env, draft, markers.join("\n"));
+  const fresh = await env.DB.prepare("SELECT raw_text FROM quizzes WHERE id = ?").bind(draft.id).first();
+  // An album arrives as many messages at once: only answer the first one to avoid spam.
+  if (msg.media_group_id && !created) return;
+  return api.send(msg.chat.id,
+    `🖼 ${what} added to ${created ? "new " : ""}draft <b>${esc(draft.title)}</b> (${draftStatus(fresh.raw_text)}).\nSend more pages, or /done when everything is in.`);
+}
+
+async function onPhoto(msg, env) {
+  // Telegram sends several sizes; take the biggest one (best for reading small text).
+  const photo = msg.photo[msg.photo.length - 1];
+  return addPicturesToDraft(env, msg, [imageMarker("tg", photo.file_id, "image/jpeg")], "Photo");
+}
+
 async function onPlainText(msg, env) {
   const api = tg(env);
   const draft = await getDraft(env, msg.from.id);
   if (!draft) {
     return api.send(msg.chat.id, "To create a quiz, first send /new <i>title</i>, then paste the questions. /help");
   }
-  const n = await appendToDraft(env, draft, msg.text);
-  return api.send(msg.chat.id, `➕ Added. Draft size: ${n.toLocaleString("en")} characters. Send more, or /done to process.`);
+  await appendToDraft(env, draft, msg.text);
+  const { raw_text } = await env.DB.prepare("SELECT raw_text FROM quizzes WHERE id = ?").bind(draft.id).first();
+  return api.send(msg.chat.id, `➕ Added. Draft: ${draftStatus(raw_text)}. Send more, or /done to process.`);
 }
 
 async function onDocument(msg, env) {
@@ -220,16 +258,26 @@ async function onDocument(msg, env) {
   const uid = msg.from.id;
   if (doc.file_size > 10 * 1024 * 1024) return api.send(msg.chat.id, "File is too big (max 10 MB).");
   const bytes = await api.downloadFile(doc.file_id);
-  const { kind, text } = await fileToText(bytes, doc.file_name || "", env);
+  const { kind, text, mime, pages } = await fileToText(bytes, doc.file_name || "", env);
   const baseTitle = (msg.caption || (doc.file_name || "Quiz").replace(/\.[^.]+$/, "")).trim();
 
   if (kind === "json") return importJson(env, uid, msg.chat.id, text, baseTitle);
+  if (kind === "image") {
+    if (bytes.length > 4 * 1024 * 1024) return api.send(msg.chat.id, "This picture is very large. Please send it as a normal photo (not as a file) so Telegram compresses it.");
+    return addPicturesToDraft(env, msg, [imageMarker("tg", doc.file_id, mime)], "Picture");
+  }
+  if (kind === "scanned") {
+    const markers = Array.from({ length: pages }, (_, i) => imageMarker("pdf", doc.file_id, i));
+    await api.send(msg.chat.id, `📄 This PDF is scanned (${pages} page picture${pages === 1 ? "" : "s"}). The AI will read each page from the image.`);
+    return addPicturesToDraft(env, { ...msg, caption: msg.caption || baseTitle }, markers, `${pages} scanned page(s)`);
+  }
 
   if (!text.trim()) return api.send(msg.chat.id, "I couldn't find any text in that file.");
   const draft = await getDraft(env, uid);
   if (draft) {
-    const n = await appendToDraft(env, draft, text);
-    return api.send(msg.chat.id, `📎 File added to draft <b>${esc(draft.title)}</b>. Draft size: ${n.toLocaleString("en")} characters. Send more, or /done.`);
+    await appendToDraft(env, draft, text);
+    const n = (await env.DB.prepare("SELECT raw_text FROM quizzes WHERE id = ?").bind(draft.id).first()).raw_text;
+    return api.send(msg.chat.id, `📎 File added to draft <b>${esc(draft.title)}</b>. Draft: ${draftStatus(n)}. Send more, or /done.`);
   }
   // No draft: the file is a whole quiz on its own.
   const quiz = await createQuiz(env, uid, baseTitle);
@@ -254,7 +302,7 @@ async function importJson(env, uid, chat, text, title) {
 
 async function startProcessing(env, quiz, chat) {
   const api = tg(env);
-  const chunks = splitIntoChunks(quiz.raw_text);
+  const chunks = planChunks(quiz.raw_text);
   if (!chunks.length) return api.send(chat, "Nothing to process.");
   const stmts = chunks.map((text, idx) =>
     env.DB.prepare("INSERT OR REPLACE INTO chunks (quiz_id, idx, text, status) VALUES (?, ?, ?, 'pending')").bind(quiz.id, idx, text));
@@ -276,7 +324,17 @@ async function processChunk(env, quizId, idx) {
   const chunk = await env.DB.prepare("SELECT * FROM chunks WHERE quiz_id = ? AND idx = ?").bind(quizId, idx).first();
   if (!chunk || chunk.status !== "pending") return; // deleted quiz or already handled
 
-  const raw = await extractQuestions(env, chunk.text);
+  const img = parseImageMarker(chunk.text);
+  let raw;
+  if (img?.type === "tg") {
+    raw = await extractQuestionsFromImage(env, await tg(env).downloadFile(img.fileId), img.mime);
+  } else if (img?.type === "pdf") {
+    const page = pdfJpegImages(await tg(env).downloadFile(img.fileId))[img.page];
+    if (!page) throw Object.assign(new Error(`Page ${img.page + 1} not found in the PDF`), { retryable: false });
+    raw = await extractQuestionsFromImage(env, page, "image/jpeg");
+  } else {
+    raw = await extractQuestions(env, chunk.text);
+  }
   const questions = raw.map(normalizeQuestion).filter(Boolean);
 
   const res = await env.DB.batch([

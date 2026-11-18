@@ -113,3 +113,27 @@ export function parseQuizJson(text) {
   if (!Array.isArray(list)) throw new Error("JSON must be an array or have a 'questions' array");
   return { title: !Array.isArray(obj) && obj.title ? String(obj.title) : null, questions: list.map(normalizeQuestion).filter(Boolean) };
 }
+
+// Pictures are stored in a draft as markers and processed one per AI call:
+//   [[img:tg:<file_id>:<mime>]]       a Telegram photo / image file
+//   [[img:pdf:<file_id>:<page>]]      page <page> (0-based) of a scanned PDF
+const IMAGE_MARKER = /\[\[img:([^\]\s]+)\]\]/g;
+
+export const imageMarker = (...parts) => `[[img:${parts.join(":")}]]`;
+
+/** Parse a marker chunk; returns null for normal text chunks. */
+export function parseImageMarker(chunk) {
+  const m = /^\[\[img:([^\]\s]+)\]\]$/.exec(String(chunk).trim());
+  if (!m) return null;
+  const [type, fileId, extra] = m[1].split(":");
+  return type === "pdf" ? { type, fileId, page: Number(extra) } : { type, fileId, mime: extra || "image/jpeg" };
+}
+
+/** Split a draft into AI jobs: text chunks first, then one job per picture. */
+export function planChunks(raw, maxChars) {
+  const markers = String(raw).match(IMAGE_MARKER) || [];
+  const text = String(raw).replace(IMAGE_MARKER, "");
+  return [...splitIntoChunks(text, maxChars), ...markers];
+}
+
+export const countImages = (raw) => (String(raw).match(IMAGE_MARKER) || []).length;

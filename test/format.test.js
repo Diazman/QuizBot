@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { buildPoll, normalizeQuestion, parseQuizJson, splitIntoChunks } from "../src/format.js";
+import { buildPoll, imageMarker, normalizeQuestion, parseImageMarker, parseQuizJson, planChunks, splitIntoChunks } from "../src/format.js";
 import { parseModelJson } from "../src/ai.js";
 
 test("splitIntoChunks keeps questions whole", () => {
@@ -46,4 +46,14 @@ test("parseQuizJson round trip", () => {
   const p = parseQuizJson(JSON.stringify({ title: "T", questions: [{ question: "q", options: ["a", "b"], correct: 1 }] }));
   assert.equal(p.title, "T");
   assert.equal(p.questions[0].correct, 1);
+});
+
+test("planChunks puts each picture in its own job", () => {
+  const raw = `1. Вопрос?\nА) да\nБ) нет\n\n${imageMarker("tg", "AbC-1_x", "image/png")}\n\n2. Ещё?\nА) 1\nБ) 2\n${imageMarker("pdf", "F1", 3)}`;
+  const chunks = planChunks(raw);
+  assert.equal(chunks.length, 3);
+  assert.match(chunks[0], /1\. Вопрос[\s\S]*2\. Ещё/);
+  assert.deepEqual(parseImageMarker(chunks[1]), { type: "tg", fileId: "AbC-1_x", mime: "image/png" });
+  assert.deepEqual(parseImageMarker(chunks[2]), { type: "pdf", fileId: "F1", page: 3 });
+  assert.equal(parseImageMarker(chunks[0]), null);
 });
