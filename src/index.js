@@ -232,7 +232,10 @@ async function runCheck(env, chat, uid, code) {
   await api.send(chat, lines.join("\n"));
   // Last check: the background worker should answer with a separate message within a few seconds.
   await env.QUIZ_QUEUE.send({ ping: chat, at: Date.now() });
-  return api.send(chat, "⏳ Testing the background worker… If no \"✅ Background worker\" message arrives within a minute, the queue consumer is not running.");
+  const { busy } = await env.DB.prepare("SELECT COUNT(*) AS busy FROM chunks WHERE status = 'pending'").first();
+  return api.send(chat, busy
+    ? `⏳ Testing the background worker… ${busy} part(s) of quizzes are being processed right now, so the "✅ Background worker" reply will come after those.`
+    : "⏳ Testing the background worker… a \"✅ Background worker\" reply should arrive within a few seconds.");
 }
 
 // ───────────────────────────── creating quizzes ─────────────────────────────
@@ -378,14 +381,29 @@ function progressBar(fraction, width = 12) {
   return "▓".repeat(full) + "░".repeat(width - full);
 }
 
-function progressText(quiz, found, note = "") {
+const mmss = (ms) => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+
+/**
+ * working: { idx, started, expectedMs } for the part this worker is reading right now.
+ * The bar then also counts that part as partly done (estimated from elapsed time),
+ * so it moves smoothly instead of jumping a whole part at a time.
+ */
+function progressText(quiz, found, note = "", working = null) {
   const total = Math.max(quiz.chunks_total, 1);
   const handled = quiz.chunks_done + quiz.chunks_failed;
-  const pct = Math.round((100 * handled) / total);
-  let t = `🤖 <b>${esc(quiz.title)}</b>\n\n${progressBar(handled / total)} ${pct}%\n`;
+  const running = handled < quiz.chunks_total;
+  let partial = 0;
+  if (running && working) {
+    const elapsed = Date.now() - working.started;
+    partial = Math.min(0.95, 1 - Math.exp(-elapsed / working.expectedMs)); // eases towards 95%
+  }
+  const fraction = Math.min(1, (handled + partial) / total);
+  const pct = Math.floor(100 * fraction);
+  let t = `🤖 <b>${esc(quiz.title)}</b>\n\n${progressBar(fraction)} ${pct}%\n`;
   t += `Parts read: <b>${handled}/${quiz.chunks_total}</b>\nQuestions found so far: <b>${found}</b>`;
   if (quiz.chunks_failed) t += `\n⚠️ Failed parts: ${quiz.chunks_failed}`;
-  t += handled < quiz.chunks_total
+  if (running && working) t += `\n🔄 Reading part ${working.idx + 1} of ${quiz.chunks_total}… ${mmss(Date.now() - working.started)}`;
+  t += running
     ? `\n\nThe AI is reading the questions and finding the correct answers…`
     : `\n\n✅ Done.`;
   if (note) t += `\n${note}`;
@@ -395,7 +413,7 @@ function progressText(quiz, found, note = "") {
 const stopKeyboard = (code) => ({ inline_keyboard: [[{ text: "⏹ Stop & delete", callback_data: `del:${code}` }]] });
 
 /** Update the "Processing…" message in place. Never fails the job if Telegram refuses the edit. */
-async function showProgress(env, quizId, progress, note = "") {
+async function showProgress(env, quizId, progress, note = "", working = null) {
   if (!progress?.msg) return;
   try {
     const quiz = await env.DB.prepare("SELECT * FROM quizzes WHERE id = ?").bind(quizId).first();
@@ -405,7 +423,7 @@ async function showProgress(env, quizId, progress, note = "") {
     await tg(env).call("editMessageText", {
       chat_id: progress.chat,
       message_id: progress.msg,
-      text: progressText(quiz, n, note),
+      text: progressText(quiz, n, note, working),
       parse_mode: "HTML",
       reply_markup: running ? stopKeyboard(quiz.code) : { inline_keyboard: [] },
     });
@@ -416,11 +434,37 @@ async function showProgress(env, quizId, progress, note = "") {
 
 // ───────────────────────────── queue consumer ─────────────────────────────
 
+let recentPartMs = 0; // moving average of how long a part takes (per worker instance)
+
 async function processChunk(env, quizId, idx, progress) {
   const chunk = await env.DB.prepare("SELECT * FROM chunks WHERE quiz_id = ? AND idx = ?").bind(quizId, idx).first();
   if (!chunk || chunk.status !== "pending") return; // deleted quiz or already handled
 
   const img = parseImageMarker(chunk.text);
+
+  // Keep the progress message alive while the AI works on this part. The expected time comes
+  // from how long recent parts actually took (falls back to a guess for the first one).
+  const guess = img ? 30_000 : 15_000 + chunk.text.length * 3;
+  const working = { idx, started: Date.now(), expectedMs: recentPartMs ? recentPartMs * 0.6 : guess };
+  let pendingEdit = showProgress(env, quizId, progress, "", working);
+  const ticker = setInterval(() => {
+    pendingEdit = pendingEdit.then(() => showProgress(env, quizId, progress, "", working));
+  }, 8000);
+  let result;
+  try {
+    result = await readChunk(env, quizId, idx, chunk, img, progress);
+  } finally {
+    clearInterval(ticker);
+    await pendingEdit; // make sure a late "reading…" edit can't overwrite the final state
+  }
+  if (!result) return;
+  const took = Date.now() - working.started;
+  recentPartMs = recentPartMs ? recentPartMs * 0.6 + took * 0.4 : took;
+  await showProgress(env, quizId, progress);
+  await maybeFinish(env, result.quizRow);
+}
+
+async function readChunk(env, quizId, idx, chunk, img, progress) {
   let raw;
   if (img?.type === "tg") {
     raw = await extractQuestionsFromImage(env, await tg(env).downloadFile(img.fileId), img.mime);
@@ -447,8 +491,8 @@ async function processChunk(env, quizId, idx, progress) {
   ]);
   const quizRow = res[res.length - 2].results[0];
   if (!quizRow) return; // deleted or already handled
-  await showProgress(env, quizId, progress);
-  await maybeFinish(env, quizRow);
+  // Final progress edit + "ready" message run after the ticker has stopped.
+  return { quizRow };
 }
 
 async function failChunk(env, quizId, idx, error, progress) {

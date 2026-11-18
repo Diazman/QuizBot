@@ -27,5 +27,5 @@ queue = "quizbot-jobs"
 queue = "quizbot-jobs"
 max_batch_size = 1        # one chunk (~20 questions) per AI call
 max_batch_timeout = 1
-max_concurrency = 2       # stay under NVIDIA free-tier rate limits
+max_concurrency = 4       # parts read in parallel (free AI endpoints are rate-limited)
 max_retries = 5
