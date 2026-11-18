@@ -50,32 +50,29 @@ This is what the AI produces. You can download it with `/export <code>`:
 ### 1. Create the Telegram bot
 Message [@BotFather](https://t.me/BotFather), send `/newbot`, and copy the **token**.
 
-### 2. Cloudflare (free)
-1. Create a free account at <https://dash.cloudflare.com>.
-2. Open **Workers & Pages** once so Cloudflare gives you a `*.workers.dev` subdomain.
-3. Copy your **Account ID** (shown on the Workers & Pages overview, right sidebar).
-4. Go to **My Profile → API Tokens → Create Token** and use the **"Edit Cloudflare Workers"** template. Also add the permissions **Account → D1 → Edit** and **Account → Queues → Edit**, then create the token and copy it.
+### 2. Give Cloudflare access to this repo
+On GitHub, open **Settings → Applications → Cloudflare Workers and Pages → Configure** (or install it from <https://github.com/apps/cloudflare-workers-and-pages>). Under **Repository access**, allow **QuizBot**, and accept any pending permission request.
 
-### 3. GitHub secrets
-In the repo, go to **Settings → Secrets and variables → Actions** and make sure these four secrets exist:
+### 3. Create the worker from the repo
+In the Cloudflare dashboard, go to **Workers & Pages → Create application → Import a repository** and pick `Diazman/QuizBot`. Use these settings:
+- Project name: `quizbot`
+- Build command: *(empty)*
+- Deploy command: `npx wrangler deploy`
+- Production branch: `main`
 
-| Secret | Value |
-|---|---|
-| `NVIDIA_API_KEY` | your NVIDIA key (`nvapi-…`) |
-| `TELEGRAM_BOT_TOKEN` | token from BotFather |
-| `CLOUDFLARE_API_TOKEN` | token from step 2.4 |
-| `CLOUDFLARE_ACCOUNT_ID` | account ID from step 2.3 |
+Every push to `main` now redeploys the bot automatically.
 
-If your NVIDIA secret has a different name, rename it, or change the `NVIDIA_API_KEY: ${{ secrets.… }}` line in `.github/workflows/deploy.yml`.
+### 4. Add the keys
+Open the **quizbot** worker and go to **Settings → Variables and Secrets**. Add these two entries with type **Secret**:
+- `TELEGRAM_BOT_TOKEN`: the BotFather token
+- `NVIDIA_API_KEY`: your NVIDIA key (`nvapi-…`)
 
-### 4. Deploy
-Merge to `main`, or open **Actions → Deploy to Cloudflare → Run workflow**. The workflow:
-- creates the D1 database and queue (only the first time),
-- applies the database schema,
-- deploys the worker and stores the two keys as Cloudflare secrets,
-- connects the Telegram webhook.
+### 5. Connect Telegram
+Open `https://quizbot.<your-subdomain>.workers.dev/setup` once. It should say "✅ Telegram is connected". Then send `/start` to your bot.
 
-Then open your bot in Telegram and send `/start`. Try it with `examples/sample-questions.txt`.
+The database (`quizbot-db`) and queue (`quizbot-jobs`) already exist, and the database ID is in `wrangler.toml`. If you ever set this up in a different Cloudflare account, create them with `npx wrangler d1 create quizbot-db` and `npx wrangler queues create quizbot-jobs`, put the new database ID in `wrangler.toml`, and run `npx wrangler d1 migrations apply quizbot-db --remote`.
+
+The GitHub Actions workflow (`.github/workflows/deploy.yml` with `scripts/deploy.sh`) is another way to deploy, using a Cloudflare API token. It only runs when you start it manually.
 
 ## How it works
 
