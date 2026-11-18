@@ -55,16 +55,27 @@ export function extractQuestionsFromImage(env, bytes, mime = "image/jpeg") {
   });
 }
 
+// If a provider times out / is overloaded, skip it for a while so every part doesn't
+// wait for it again. (Per worker instance; resets on redeploy.)
+const PAUSE_MS = 10 * 60_000;
+const pausedUntil = {};
+export const isPaused = (name) => (pausedUntil[name] || 0) > Date.now();
+export const resetPauses = () => { for (const k of Object.keys(pausedUntil)) delete pausedUntil[k]; };
+
 /** Try NVIDIA, then OpenRouter. Bad JSON from a model also counts as a failure. */
 async function withFallback(env, { userContent, vision }) {
   const errors = [];
-  for (const provider of providers(env, vision)) {
+  const all = providers(env, vision);
+  // Skip paused providers, unless that would leave nothing to try.
+  const usable = all.filter((p) => !isPaused(p.name));
+  for (const provider of usable.length ? usable : all) {
     try {
       await provider.resolve?.();
       const { content } = await chat(provider, userContent);
       return parseModelJson(content);
     } catch (e) {
       console.error(`${provider.name} failed:`, e?.message);
+      if (e.overloaded && all.length > 1) pausedUntil[provider.name] = Date.now() + PAUSE_MS;
       errors.push(e);
     }
   }
@@ -84,8 +95,8 @@ export function providers(env, vision = false) {
       baseUrl: env.NVIDIA_BASE_URL || NVIDIA_BASE_URL,
       key: env.NVIDIA_API_KEY,
       models: [(vision && env.NVIDIA_VISION_MODEL) || env.NVIDIA_MODEL || NVIDIA_MODEL],
-      // Leave time for the fallback if NVIDIA hangs.
-      timeoutMs: Number(env.NVIDIA_TIMEOUT_MS) || (env.OPENROUTER_API_KEY ? 150_000 : 300_000),
+      // With a backup available, don't wait long for a slow NVIDIA.
+      timeoutMs: Number(env.NVIDIA_TIMEOUT_MS) || (env.OPENROUTER_API_KEY ? 90_000 : 300_000),
     });
   }
   if (env.OPENROUTER_API_KEY) {
@@ -185,7 +196,7 @@ async function chat(provider, userContent, { maxTokens = 16000, system = SYSTEM_
     const timedOut = e?.name === "TimeoutError" || e?.name === "AbortError";
     throw Object.assign(
       new Error(`${provider.name}: ${timedOut ? `no answer within ${Math.round(limit / 1000)}s` : `unreachable (${e?.message || e})`}`),
-      { retryable: true },
+      { retryable: true, overloaded: timedOut },
     );
   }
   const text = await res.text();
@@ -193,6 +204,7 @@ async function chat(provider, userContent, { maxTokens = 16000, system = SYSTEM_
     // 429 / 5xx are temporary; 4xx (bad key, bad model, image too big) are not.
     throw Object.assign(new Error(`${provider.name} ${res.status}: ${text.slice(0, 250)}`), {
       retryable: res.status === 429 || res.status >= 500,
+      overloaded: res.status === 429 || res.status >= 500,
     });
   }
   const data = JSON.parse(text);

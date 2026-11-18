@@ -37,6 +37,8 @@ function mockFetch(nvidiaReply) {
   };
 }
 const env = { NVIDIA_API_KEY: "n", OPENROUTER_API_KEY: "o" };
+import { resetPauses as _reset } from "../src/ai.js";
+beforeEach(() => _reset());
 
 test("NVIDIA ok: OpenRouter is not called", async () => {
   mockFetch(() => new Response(GOOD));
@@ -69,4 +71,17 @@ test("both fail: error is retryable and mentions both", async () => {
     ? new Response(JSON.stringify({ data: MODELS }))
     : new Response("busy", { status: 429 });
   await assert.rejects(extractQuestions(env, "t"), (e) => e.retryable === true && /NVIDIA 429/.test(e.message) && /OpenRouter 429/.test(e.message));
+});
+
+test("an overloaded NVIDIA is skipped for the next parts", async () => {
+  const { resetPauses } = await import("../src/ai.js");
+  resetPauses();
+  mockFetch(() => new Response("overloaded", { status: 503 }));
+  await extractQuestions(env, "part 1");
+  const nvidiaCallsAfterFirst = calls.filter((c) => c.url.includes("nvidia")).length;
+  assert.equal(nvidiaCallsAfterFirst, 1);
+  calls.length = 0;
+  await extractQuestions(env, "part 2");
+  assert.equal(calls.filter((c) => c.url.includes("nvidia")).length, 0, "NVIDIA should be paused");
+  resetPauses();
 });
