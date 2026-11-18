@@ -2,6 +2,8 @@ name = "quizbot"
 main = "src/index.js"
 compatibility_date = "2026-11-01"
 workers_dev = true
+# Keep variables added in the Cloudflare dashboard when deploying (otherwise each deploy removes them).
+keep_vars = true
 
 [vars]
 NVIDIA_MODEL = "z-ai/glm-5.3-flash"
