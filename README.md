@@ -2,12 +2,12 @@
 
 A Telegram bot that turns a pile of multiple-choice questions (any format) into **Telegram quiz polls** you can share with others.
 
-1. You send the bot your questions (paste text, or upload `.txt` / `.docx`).
+1. You send the bot your questions (paste text, or upload **PDF** / `.docx` / `.txt`).
 2. The AI (**GLM-5.3 Flash on NVIDIA**, `z-ai/glm-5.3-flash`) reads them, strips the A)/Б)/1) labels, **finds the correct answer** for each one (or uses yours if you marked it, e.g. `Ответ: Б` or bold), and writes a short explanation.
 3. The bot stores every question in a fixed format and gives you a **share link** like `https://t.me/YourBot?start=q_ab12cd34`.
 4. Anyone who opens the link picks 10 / 20 / 50 / all questions and gets them as quiz polls one by one, in random order, with a score at the end.
 
-It runs on the **Cloudflare Workers free tier** (Worker + D1 database + Queues). GitHub Actions only **deploys** it and copies your GitHub secrets into Cloudflare. Nothing runs on GitHub after that.
+It runs on the **Cloudflare Workers free tier** (Worker + D1 database + Queues; PDFs are converted to text with Workers AI `toMarkdown`, which is free for PDFs). GitHub Actions only **deploys** it and copies your GitHub secrets into Cloudflare. Nothing runs on GitHub after that.
 
 ## The bot's question format
 

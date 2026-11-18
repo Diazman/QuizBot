@@ -69,13 +69,35 @@ export async function docxToText(bytes) {
   return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+/**
+ * Extract text from a PDF using Cloudflare Workers AI "toMarkdown" (free for PDFs).
+ * The conversion runs on Cloudflare's side, so it doesn't use the Worker's CPU budget.
+ */
+export async function pdfToText(env, bytes, fileName = "file.pdf") {
+  if (!env?.AI?.toMarkdown) throw new Error("PDF support needs the Workers AI binding (\"AI\") in wrangler.toml.");
+  const out = await env.AI.toMarkdown([{ name: fileName, blob: new Blob([bytes], { type: "application/pdf" }) }]);
+  const res = Array.isArray(out) ? out[0] : out;
+  if (!res || res.format === "error") throw new Error(`Could not read the PDF${res?.error ? `: ${res.error}` : "."}`);
+  const text = String(res.data ?? "")
+    .replace(/^---[\s\S]*?---\s*/, "")      // drop metadata front matter
+    .replace(/^#{1,6}\s+Page \d+\s*$/gim, "") // drop "## Page N" headings
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (text.replace(/\s/g, "").length < 20) {
+    throw new Error("This PDF has no readable text — it is probably scanned pictures. Please send a PDF with real text, a .docx or a .txt.");
+  }
+  return text;
+}
+
 /** Returns { kind: "json" | "text", text } for a Telegram document. */
-export async function fileToText(bytes, fileName = "") {
+export async function fileToText(bytes, fileName = "", env = {}) {
   const lower = fileName.toLowerCase();
+  const isPdf = lower.endsWith(".pdf") || (bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46); // %PDF
+  if (isPdf) return { kind: "text", text: await pdfToText(env, bytes, fileName || "file.pdf") };
   if (lower.endsWith(".docx")) return { kind: "text", text: await docxToText(bytes) };
   if (lower.endsWith(".json")) return { kind: "json", text: decodeText(bytes) };
-  if (lower.endsWith(".doc") || lower.endsWith(".pdf")) {
-    throw new Error("Please save the file as .docx or .txt (old .doc and PDF are not supported).");
+  if (lower.endsWith(".doc")) {
+    throw new Error("Old .doc files are not supported. Please save it as .docx or PDF and send again.");
   }
   return { kind: "text", text: decodeText(bytes) };
 }

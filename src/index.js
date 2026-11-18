@@ -115,7 +115,7 @@ async function handleUpdate(update, env) {
       const quiz = await createQuiz(env, uid, title);
       await env.DB.prepare("INSERT OR REPLACE INTO drafts (user_id, quiz_id) VALUES (?, ?)").bind(uid, quiz.id).run();
       return api.send(chat,
-        `📝 New quiz <b>${esc(title)}</b>.\n\nNow send me the questions: paste them as messages (as many as you need) and/or upload <b>.txt</b> / <b>.docx</b> files.\nWhen everything is sent, type /done.`);
+        `📝 New quiz <b>${esc(title)}</b>.\n\nNow send me the questions: paste them as messages (as many as you need) and/or upload <b>PDF</b> / <b>.docx</b> / <b>.txt</b> files.\nWhen everything is sent, type /done.`);
     }
     case "/done": {
       const draft = await getDraft(env, uid);
@@ -165,7 +165,7 @@ const HELP = `🇷🇺 <b>Russian Quiz Bot</b>
 
 <b>Create a quiz</b>
 1. /new <i>title</i>
-2. Send your questions (paste text or upload .txt / .docx). Any format works — numbered questions with A/B/C/D options are perfect. If you already marked answers (e.g. "Ответ: Б" or bold), the AI uses them; otherwise it solves the questions itself.
+2. Send your questions (paste text or upload PDF / .docx / .txt). Any format works — numbered questions with A/B/C/D options are perfect. If you already marked answers (e.g. "Ответ: Б" or bold), the AI uses them; otherwise it solves the questions itself.
 3. /done — the AI finds the correct answers and builds the quiz polls.
 Tip: you can also just upload a file without /new — it becomes a quiz straight away.
 
@@ -220,7 +220,7 @@ async function onDocument(msg, env) {
   const uid = msg.from.id;
   if (doc.file_size > 10 * 1024 * 1024) return api.send(msg.chat.id, "File is too big (max 10 MB).");
   const bytes = await api.downloadFile(doc.file_id);
-  const { kind, text } = await fileToText(bytes, doc.file_name || "");
+  const { kind, text } = await fileToText(bytes, doc.file_name || "", env);
   const baseTitle = (msg.caption || (doc.file_name || "Quiz").replace(/\.[^.]+$/, "")).trim();
 
   if (kind === "json") return importJson(env, uid, msg.chat.id, text, baseTitle);

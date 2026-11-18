@@ -7,6 +7,10 @@ workers_dev = true
 NVIDIA_MODEL = "z-ai/glm-5.3-flash"
 # BOT_USERNAME = "your_bot"   # optional; looked up automatically otherwise
 
+# Workers AI: used only to turn PDFs into text (free for PDFs)
+[ai]
+binding = "AI"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "quizbot-db"
