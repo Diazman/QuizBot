@@ -2,7 +2,7 @@
 //  fetch: Telegram webhook (commands, uploads, poll answers)
 //  queue: AI processing of question chunks (runs in the background, retried on failure)
 
-import { extractQuestions, extractQuestionsFromImage, pingModel } from "./ai.js";
+import { extractQuestions, extractQuestionsFromImage, pingProviders } from "./ai.js";
 import { buildPoll, countImages, imageMarker, normalizeQuestion, parseImageMarker, parseQuizJson, planChunks, randomCode, shuffle } from "./format.js";
 import { fileToText, pdfJpegImages } from "./files.js";
 import { esc, tg, webhookSecret } from "./telegram.js";
@@ -199,18 +199,22 @@ async function runCheck(env, chat, uid, code) {
   const api = tg(env);
   await api.send(chat, "🔎 Checking… (takes up to ~30 seconds)");
   const lines = [];
-  lines.push(env.NVIDIA_API_KEY ? "✅ NVIDIA key: set" : "❌ NVIDIA key: missing (add NVIDIA_API_KEY as a Secret in Cloudflare)");
+  lines.push(env.NVIDIA_API_KEY ? "✅ NVIDIA key: set" : "⚠️ NVIDIA key: missing (NVIDIA_API_KEY)");
+  lines.push(env.OPENROUTER_API_KEY ? "✅ OpenRouter key (backup AI): set" : "⚠️ OpenRouter key (backup AI): missing (OPENROUTER_API_KEY)");
   lines.push(env.AI ? "✅ PDF converter (Workers AI): connected" : "⚠️ PDF converter (Workers AI): not connected");
 
-  if (env.NVIDIA_API_KEY) {
-    try {
-      const r = await pingModel(env);
-      lines.push(`✅ AI model <code>${esc(r.model)}</code> answered in ${(r.ms / 1000).toFixed(1)}s: "${esc(String(r.content).replace(/<think>[\s\S]*?<\/think>/g, "").trim().slice(0, 40))}"`);
-      if (r.ms > 15000) lines.push("⚠️ The AI is slow right now, so each part of a quiz can take several minutes.");
-    } catch (e) {
-      lines.push(`❌ AI model: ${esc(e.message).slice(0, 300)}`);
+  const pings = await pingProviders(env);
+  if (!pings.length) lines.push("❌ No AI is configured: add NVIDIA_API_KEY and/or OPENROUTER_API_KEY as Secrets in Cloudflare.");
+  for (const p of pings) {
+    if (p.ok) {
+      const said = String(p.content).replace(/<think>[\s\S]*?<\/think>/g, "").trim().slice(0, 30);
+      lines.push(`✅ ${p.name} <code>${esc(p.model)}</code> answered in ${(p.ms / 1000).toFixed(1)}s: "${esc(said)}"`);
+      if (p.ms > 15000) lines.push(`⚠️ ${p.name} is slow right now; each part of a quiz can take minutes.`);
+    } else {
+      lines.push(`❌ ${p.name} (<code>${esc(p.model)}</code>): ${esc(p.error).slice(0, 250)}`);
     }
   }
+  if (pings.length > 1) lines.push("ℹ️ NVIDIA is used first; OpenRouter is the backup when NVIDIA fails.");
 
   if (code) {
     const quiz = await ownedQuiz(env, uid, code);
