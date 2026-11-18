@@ -384,25 +384,29 @@ function progressBar(fraction, width = 12) {
 const mmss = (ms) => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
 
 /**
- * working: { idx, started, expectedMs } for the part this worker is reading right now.
- * The bar then also counts that part as partly done (estimated from elapsed time),
- * so it moves smoothly instead of jumping a whole part at a time.
+ * reading: [{ idx, started }] for every part the AI is reading right now (from all workers).
+ * Each counts as partly done (estimated from elapsed time), so the bar moves smoothly
+ * instead of jumping a whole part at a time.
  */
-function progressText(quiz, found, note = "", working = null) {
+export function progressText(quiz, found, note = "", reading = [], expectedMs = 40_000) {
   const total = Math.max(quiz.chunks_total, 1);
   const handled = quiz.chunks_done + quiz.chunks_failed;
   const running = handled < quiz.chunks_total;
   let partial = 0;
-  if (running && working) {
-    const elapsed = Date.now() - working.started;
-    partial = Math.min(0.95, 1 - Math.exp(-elapsed / working.expectedMs)); // eases towards 95%
+  if (running) {
+    for (const r of reading) partial += Math.min(0.95, 1 - Math.exp(-(Date.now() - r.started) / expectedMs)); // eases towards 95%
   }
   const fraction = Math.min(1, (handled + partial) / total);
   const pct = Math.floor(100 * fraction);
   let t = `🤖 <b>${esc(quiz.title)}</b>\n\n${progressBar(fraction)} ${pct}%\n`;
   t += `Parts read: <b>${handled}/${quiz.chunks_total}</b>\nQuestions found so far: <b>${found}</b>`;
   if (quiz.chunks_failed) t += `\n⚠️ Failed parts: ${quiz.chunks_failed}`;
-  if (running && working) t += `\n🔄 Reading part ${working.idx + 1} of ${quiz.chunks_total}… ${mmss(Date.now() - working.started)}`;
+  if (running && reading.length) {
+    const parts = reading.map((r) => r.idx + 1);
+    const label = parts.length === 1 ? `part ${parts[0]}` : `parts ${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}`;
+    const longest = Math.max(...reading.map((r) => Date.now() - r.started));
+    t += `\n🔄 Reading ${label}${reading.length > 1 ? " at the same time" : ""}… ${mmss(longest)}`;
+  }
   t += running
     ? `\n\nThe AI is reading the questions and finding the correct answers…`
     : `\n\n✅ Done.`;
@@ -413,17 +417,24 @@ function progressText(quiz, found, note = "", working = null) {
 const stopKeyboard = (code) => ({ inline_keyboard: [[{ text: "⏹ Stop & delete", callback_data: `del:${code}` }]] });
 
 /** Update the "Processing…" message in place. Never fails the job if Telegram refuses the edit. */
-async function showProgress(env, quizId, progress, note = "", working = null) {
+async function showProgress(env, quizId, progress, note = "", expectedMs = 40_000) {
   if (!progress?.msg) return;
   try {
     const quiz = await env.DB.prepare("SELECT * FROM quizzes WHERE id = ?").bind(quizId).first();
     if (!quiz) return;
     const { n } = await env.DB.prepare("SELECT COUNT(*) AS n FROM questions WHERE quiz_id = ?").bind(quizId).first();
     const running = quiz.chunks_done + quiz.chunks_failed < quiz.chunks_total;
+    let reading = [];
+    if (running) {
+      await ensureReadingTable(env);
+      // Ignore leftovers from a worker that was killed (a part never takes longer than 15 min).
+      ({ results: reading } = await env.DB.prepare("SELECT idx, started FROM reading WHERE quiz_id = ? AND started > ? ORDER BY idx")
+        .bind(quizId, Date.now() - 15 * 60_000).all());
+    }
     await tg(env).call("editMessageText", {
       chat_id: progress.chat,
       message_id: progress.msg,
-      text: progressText(quiz, n, note, working),
+      text: progressText(quiz, n, note, reading, expectedMs),
       parse_mode: "HTML",
       reply_markup: running ? stopKeyboard(quiz.code) : { inline_keyboard: [] },
     });
@@ -436,6 +447,17 @@ async function showProgress(env, quizId, progress, note = "", working = null) {
 
 let recentPartMs = 0; // moving average of how long a part takes (per worker instance)
 
+// The "reading" table (migrations/0002) is created on first use, because deploys from
+// the Cloudflare dashboard don't run migrations.
+let readingTableReady = false;
+async function ensureReadingTable(env) {
+  if (readingTableReady) return;
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS reading (quiz_id INTEGER NOT NULL, idx INTEGER NOT NULL, started INTEGER NOT NULL, PRIMARY KEY (quiz_id, idx))",
+  ).run();
+  readingTableReady = true;
+}
+
 async function processChunk(env, quizId, idx, progress) {
   const chunk = await env.DB.prepare("SELECT * FROM chunks WHERE quiz_id = ? AND idx = ?").bind(quizId, idx).first();
   if (!chunk || chunk.status !== "pending") return; // deleted quiz or already handled
@@ -446,9 +468,11 @@ async function processChunk(env, quizId, idx, progress) {
   // from how long recent parts actually took (falls back to a guess for the first one).
   const guess = img ? 30_000 : 15_000 + chunk.text.length * 3;
   const working = { idx, started: Date.now(), expectedMs: recentPartMs ? recentPartMs * 0.6 : guess };
-  let pendingEdit = showProgress(env, quizId, progress, "", working);
+  await ensureReadingTable(env);
+  await env.DB.prepare("INSERT OR REPLACE INTO reading (quiz_id, idx, started) VALUES (?, ?, ?)").bind(quizId, idx, working.started).run();
+  let pendingEdit = showProgress(env, quizId, progress, "", working.expectedMs);
   const ticker = setInterval(() => {
-    pendingEdit = pendingEdit.then(() => showProgress(env, quizId, progress, "", working));
+    pendingEdit = pendingEdit.then(() => showProgress(env, quizId, progress, "", working.expectedMs));
   }, 8000);
   let result;
   try {
@@ -456,6 +480,7 @@ async function processChunk(env, quizId, idx, progress) {
   } finally {
     clearInterval(ticker);
     await pendingEdit; // make sure a late "reading…" edit can't overwrite the final state
+    await env.DB.prepare("DELETE FROM reading WHERE quiz_id = ? AND idx = ?").bind(quizId, idx).run().catch(() => {});
   }
   if (!result) return;
   const took = Date.now() - working.started;
@@ -578,7 +603,9 @@ const ownedQuiz = (env, uid, code) =>
   code ? env.DB.prepare("SELECT * FROM quizzes WHERE code = ? AND owner_id = ?").bind(code.replace(/^q_/, ""), uid).first() : null;
 
 async function deleteQuiz(env, quizId) {
+  await ensureReadingTable(env);
   await env.DB.batch([
+    env.DB.prepare("DELETE FROM reading WHERE quiz_id = ?").bind(quizId),
     env.DB.prepare("DELETE FROM questions WHERE quiz_id = ?").bind(quizId),
     env.DB.prepare("DELETE FROM chunks WHERE quiz_id = ?").bind(quizId),
     env.DB.prepare("DELETE FROM sessions WHERE quiz_id = ?").bind(quizId),
