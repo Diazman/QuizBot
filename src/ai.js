@@ -41,10 +41,14 @@ export function extractQuestionsFromImage(env, bytes, mime = "image/jpeg") {
   ]);
 }
 
-async function chat(env, model, userContent) {
+async function chat(env, model, userContent, { timeoutMs, maxTokens = 16000, system = SYSTEM_PROMPT, raw = false } = {}) {
   if (!env.NVIDIA_API_KEY) throw new Error("NVIDIA_API_KEY secret is not set");
   const baseUrl = (env.NVIDIA_BASE_URL || DEFAULT_BASE_URL).replace(/\/+$/, "");
-  const res = await fetch(`${baseUrl}/chat/completions`, {
+  const limit = timeoutMs || Number(env.NVIDIA_TIMEOUT_MS) || 300_000;
+  let res;
+  try {
+    res = await fetch(`${baseUrl}/chat/completions`, {
+    signal: AbortSignal.timeout(limit),
     method: "POST",
     headers: {
       Authorization: `Bearer ${env.NVIDIA_API_KEY}`,
@@ -54,15 +58,21 @@ async function chat(env, model, userContent) {
     body: JSON.stringify({
       model,
       messages: [
-        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: system },
         { role: "user", content: userContent },
       ],
       temperature: 0.2,
       top_p: 0.9,
-      max_tokens: 16000,
+      max_tokens: maxTokens,
       stream: false,
     }),
   });
+  } catch (e) {
+    const timedOut = e?.name === "TimeoutError" || e?.name === "AbortError";
+    const err = new Error(timedOut ? `NVIDIA API did not answer within ${Math.round(limit / 1000)}s` : `NVIDIA API unreachable: ${e?.message || e}`);
+    err.retryable = true;
+    throw err;
+  }
 
   const body = await res.text();
   if (!res.ok) {
@@ -73,7 +83,20 @@ async function chat(env, model, userContent) {
   }
   const data = JSON.parse(body);
   const content = data?.choices?.[0]?.message?.content ?? "";
+  if (raw) return { content, finish: data?.choices?.[0]?.finish_reason, usage: data?.usage };
   return parseModelJson(content);
+}
+
+/** Tiny request used by /check to see whether the NVIDIA key + model work, and how fast. */
+export async function pingModel(env) {
+  const started = Date.now();
+  const r = await chat(env, env.NVIDIA_MODEL || DEFAULT_MODEL, "Reply with the single word: OK", {
+    timeoutMs: 25_000,
+    maxTokens: 2000,
+    system: "You are a helpful assistant.",
+    raw: true,
+  });
+  return { ...r, ms: Date.now() - started, model: env.NVIDIA_MODEL || DEFAULT_MODEL };
 }
 
 /** Base64-encode bytes (native toBase64 when the runtime has it — much cheaper on CPU). */

@@ -2,7 +2,7 @@
 //  fetch: Telegram webhook (commands, uploads, poll answers)
 //  queue: AI processing of question chunks (runs in the background, retried on failure)
 
-import { extractQuestions, extractQuestionsFromImage } from "./ai.js";
+import { extractQuestions, extractQuestionsFromImage, pingModel } from "./ai.js";
 import { buildPoll, countImages, imageMarker, normalizeQuestion, parseImageMarker, parseQuizJson, planChunks, randomCode, shuffle } from "./format.js";
 import { fileToText, pdfJpegImages } from "./files.js";
 import { esc, tg, webhookSecret } from "./telegram.js";
@@ -35,6 +35,11 @@ export default {
 
   async queue(batch, env) {
     for (const msg of batch.messages) {
+      if (msg.body?.ping) { // /check: proves the background worker is attached and running
+        await tg(env).send(msg.body.ping, `✅ Background worker: running (picked up the test job after ${Math.round((Date.now() - msg.body.at) / 1000)}s).`).catch(() => {});
+        msg.ack();
+        continue;
+      }
       try {
         await processChunk(env, msg.body.quizId, msg.body.idx, msg.body.progress);
         msg.ack();
@@ -72,7 +77,9 @@ async function setup(env, origin) {
         { command: "my", description: "My quizzes and share links" },
         { command: "practice", description: "Practise a quiz by code" },
         { command: "export", description: "Download a quiz as JSON" },
-        { command: "stop", description: "Stop the current quiz" },
+        { command: "check", description: "Test the AI / see why a quiz is stuck" },
+        { command: "check", description: "Test the AI / see why a quiz is stuck" },
+    { command: "stop", description: "Stop the current quiz" },
         { command: "help", description: "How it works" },
       ],
     });
@@ -152,6 +159,8 @@ async function handleUpdate(update, env) {
       if (!code) return api.send(chat, "Usage: /practice <i>code</i>");
       return offerQuiz(env, chat, code);
     }
+    case "/check":
+      return runCheck(env, chat, uid, arg);
     case "/stop": {
       const s = await env.DB.prepare("SELECT * FROM sessions WHERE user_id = ?").bind(uid).first();
       if (!s) return api.send(chat, "No quiz running.");
@@ -178,10 +187,48 @@ After processing you get a link. Anyone who opens it gets the questions as Teleg
 /my — your quizzes and share links
 /practice <i>code</i> — practise a quiz
 /export <i>code</i> — download the quiz in bot format (JSON). Edit it and upload it back to fix answers.
-/retry <i>code</i> — re-run parts that failed
+/retry <i>code</i> — re-run parts that failed or got stuck
 /delete <i>code</i> — delete a quiz
+/check <i>code</i> — test the AI and see why a quiz is stuck
 /stop — stop the current practice
 /cancel — discard the current draft`;
+
+// ───────────────────────────── diagnostics ─────────────────────────────
+
+async function runCheck(env, chat, uid, code) {
+  const api = tg(env);
+  await api.send(chat, "🔎 Checking… (takes up to ~30 seconds)");
+  const lines = [];
+  lines.push(env.NVIDIA_API_KEY ? "✅ NVIDIA key: set" : "❌ NVIDIA key: missing (add NVIDIA_API_KEY as a Secret in Cloudflare)");
+  lines.push(env.AI ? "✅ PDF converter (Workers AI): connected" : "⚠️ PDF converter (Workers AI): not connected");
+
+  if (env.NVIDIA_API_KEY) {
+    try {
+      const r = await pingModel(env);
+      lines.push(`✅ AI model <code>${esc(r.model)}</code> answered in ${(r.ms / 1000).toFixed(1)}s: "${esc(String(r.content).replace(/<think>[\s\S]*?<\/think>/g, "").trim().slice(0, 40))}"`);
+      if (r.ms > 15000) lines.push("⚠️ The AI is slow right now, so each part of a quiz can take several minutes.");
+    } catch (e) {
+      lines.push(`❌ AI model: ${esc(e.message).slice(0, 300)}`);
+    }
+  }
+
+  if (code) {
+    const quiz = await ownedQuiz(env, uid, code);
+    if (!quiz) lines.push(`❓ Quiz <code>${esc(code)}</code> not found (see /my).`);
+    else {
+      const { results } = await env.DB.prepare("SELECT status, COUNT(*) AS n FROM chunks WHERE quiz_id = ? GROUP BY status").bind(quiz.id).all();
+      const counts = Object.fromEntries(results.map((r) => [r.status, r.n]));
+      lines.push(`📊 <b>${esc(quiz.title)}</b>: ${quiz.status}. Parts: ${counts.done || 0} done, ${counts.pending || 0} waiting, ${counts.failed || 0} failed.`);
+      const err = await env.DB.prepare("SELECT idx, error FROM chunks WHERE quiz_id = ? AND error IS NOT NULL ORDER BY idx LIMIT 1").bind(quiz.id).first();
+      if (err) lines.push(`Last error (part ${err.idx + 1}): <code>${esc(err.error).slice(0, 300)}</code>`);
+    }
+  }
+
+  await api.send(chat, lines.join("\n"));
+  // Last check: the background worker should answer with a separate message within a few seconds.
+  await env.QUIZ_QUEUE.send({ ping: chat, at: Date.now() });
+  return api.send(chat, "⏳ Testing the background worker… If no \"✅ Background worker\" message arrives within a minute, the queue consumer is not running.");
+}
 
 // ───────────────────────────── creating quizzes ─────────────────────────────
 
@@ -433,15 +480,16 @@ async function insertQuestions(env, quizId, basePos, questions) {
 
 async function retryFailed(env, quiz, chat) {
   const api = tg(env);
-  const { results } = await env.DB.prepare("SELECT idx FROM chunks WHERE quiz_id = ? AND status = 'failed'").bind(quiz.id).all();
-  if (!results.length) return api.send(chat, "No failed parts to retry.");
+  // Failed parts, plus parts stuck in "waiting" (e.g. the background job was killed).
+  const { results } = await env.DB.prepare("SELECT idx FROM chunks WHERE quiz_id = ? AND status IN ('failed', 'pending')").bind(quiz.id).all();
+  if (!results.length) return api.send(chat, "Nothing to retry: all parts are done.");
   await env.DB.batch([
-    env.DB.prepare("UPDATE chunks SET status = 'pending' WHERE quiz_id = ? AND status = 'failed'").bind(quiz.id),
+    env.DB.prepare("UPDATE chunks SET status = 'pending', error = NULL WHERE quiz_id = ? AND status = 'failed'").bind(quiz.id),
     env.DB.prepare("UPDATE quizzes SET status = 'processing', chunks_failed = 0, chunks_done = chunks_total - ? WHERE id = ?").bind(results.length, quiz.id),
   ]);
   const fresh = await env.DB.prepare("SELECT * FROM quizzes WHERE id = ?").bind(quiz.id).first();
   const { n } = await env.DB.prepare("SELECT COUNT(*) AS n FROM questions WHERE quiz_id = ?").bind(quiz.id).first();
-  const sent = await api.send(chat, progressText(fresh, n, `🔁 Retrying ${results.length} failed part(s)…`));
+  const sent = await api.send(chat, progressText(fresh, n, `🔁 Retrying ${results.length} part(s)…`));
   const progress = { chat, msg: sent.message_id };
   await env.QUIZ_QUEUE.sendBatch(results.map((r) => ({ body: { quizId: quiz.id, idx: r.idx, progress } })));
 }
