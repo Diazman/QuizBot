@@ -171,3 +171,42 @@ test("photos go to Gemini as an image", async () => {
   const g = calls.find((c) => c.url.includes("generativelanguage"));
   assert.ok(g.body.messages[1].content.some((p) => p.type === "image_url" && p.image_url.url.startsWith("data:image/jpeg;base64,")));
 });
+
+// ── streaming ──
+const sse = (chunks, { delayMs = 0 } = {}) => new Response(new ReadableStream({
+  async start(c) {
+    const enc = new TextEncoder();
+    for (const ch of chunks) { if (delayMs) await new Promise((r) => setTimeout(r, delayMs)); c.enqueue(enc.encode(ch)); }
+    c.close();
+  },
+}), { headers: { "content-type": "text/event-stream" } });
+
+test("streamed answer is assembled (keep-alive comments ignored)", async () => {
+  const json = '{"questions":[{"question":"q","options":["a","b"],"correct":1}]}';
+  const parts = [json.slice(0, 20), json.slice(20)];
+  mockAll({
+    gemini: () => sse([
+      ": OPENROUTER PROCESSING\n\n",
+      ...parts.map((p) => `data: ${JSON.stringify({ model: "gemini-x", choices: [{ delta: { content: p } }] })}\n\n`),
+      "data: [DONE]\n\n",
+    ]),
+  });
+  const q = await extractQuestions({ ...genv, GEMINI_MODEL: "gemini-x" }, "t");
+  assert.equal(q[0].correct, 1);
+});
+
+test("error event inside a stream falls back to the next AI", async () => {
+  mockAll({ gemini: () => sse(['data: {"error":{"message":"overloaded","code":503}}\n\n']) });
+  assert.equal((await extractQuestions({ ...genv, GEMINI_MODEL: "gemini-x" }, "t")).length, 1);
+  assert.ok(calls.some((c) => c.url.includes("openrouter.ai/api/v1/chat")));
+});
+
+test("server connects but never starts answering -> gives up quickly and falls back", async () => {
+  mockAll({
+    gemini: () => new Response(new ReadableStream({ start() {} }), { headers: { "content-type": "text/event-stream" } }),
+  });
+  const t0 = Date.now();
+  const q = await extractQuestions({ ...genv, GEMINI_MODEL: "gemini-x", AI_FIRST_DATA_MS: "300" }, "t");
+  assert.equal(q.length, 1);
+  assert.ok(Date.now() - t0 < 3000, "should not wait long");
+});

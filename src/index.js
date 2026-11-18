@@ -198,7 +198,7 @@ After processing you get a link. Anyone who opens it gets the questions as Teleg
 
 async function runCheck(env, chat, uid, code) {
   const api = tg(env);
-  await api.send(chat, "🔎 Checking… (takes up to ~30 seconds)");
+  await api.send(chat, "🔎 Checking… (takes up to ~1 minute)");
   const lines = [];
   lines.push(env.NVIDIA_API_KEY ? "✅ NVIDIA key: set" : "⚠️ NVIDIA key: missing (NVIDIA_API_KEY)");
   lines.push(env.OPENROUTER_API_KEY ? "✅ OpenRouter key (backup AI): set" : "⚠️ OpenRouter key (backup AI): missing (OPENROUTER_API_KEY)");
@@ -211,7 +211,10 @@ async function runCheck(env, chat, uid, code) {
       lines.push(`✅ OpenRouter key works; model <code>${esc(p.model)}</code>${p.freeTier ? " (free tier: 50 free requests/day; buy $10 credits once for 1000/day)" : ""}`);
     } else if (p.ok) {
       const said = String(p.content).replace(/<think>[\s\S]*?<\/think>/g, "").trim().slice(0, 30);
-      lines.push(`✅ ${p.name} <code>${esc(p.model)}</code> answered in ${(p.ms / 1000).toFixed(1)}s: "${esc(said)}"`);
+      const stages = p.connectMs != null && p.workersAi !== true
+        ? ` (connected ${(p.connectMs / 1000).toFixed(1)}s, first words ${((p.firstTokenMs ?? p.ms) / 1000).toFixed(1)}s)`
+        : "";
+      lines.push(`✅ ${p.name} <code>${esc(p.model)}</code> answered in ${(p.ms / 1000).toFixed(1)}s${stages}: "${esc(said)}"`);
       if (p.ms > 15000) lines.push(`⚠️ ${p.name} is slow right now; each part of a quiz can take minutes.`);
     } else {
       lines.push(isDailyLimit(p.error)

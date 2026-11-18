@@ -155,6 +155,7 @@ export function providers(env, vision = false) {
       timeoutMs: 180_000,
     });
   }
+  for (const p of list) p.firstDataMs ??= Number(env.AI_FIRST_DATA_MS) || 45_000;
   const order = String(env.AI_ORDER || "gemini,openrouter,nvidia,workers-ai").toLowerCase().split(",").map((x) => x.trim());
   const pos = (p) => { const i = order.indexOf(p.name.toLowerCase().replace(/\s+/g, "-")); return i === -1 ? order.length : i; };
   return list.sort((a, b) => pos(a) - pos(b));
@@ -226,51 +227,118 @@ async function chat(provider, userContent, { maxTokens = 16000, system = SYSTEM_
     temperature: 0.2,
     top_p: 0.9,
     max_tokens: maxTokens,
-    stream: false,
+    // Streaming lets us tell "the service never answered" apart from "it's busy writing",
+    // and give up on a dead connection quickly instead of waiting the whole timeout.
+    stream: true,
   };
   // OpenRouter accepts a list of models and falls back between them itself.
   if (provider.models.length > 1) body.models = provider.models;
   else body.model = provider.models[0];
 
   const started = Date.now();
-  let res;
-  try {
-    res = await fetch(`${provider.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
-      method: "POST",
-      signal: AbortSignal.timeout(limit),
-      headers: {
-        Authorization: `Bearer ${provider.key}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        ...(provider.extraHeaders || {}),
-      },
-      body: JSON.stringify(body),
-    });
-  } catch (e) {
-    const timedOut = e?.name === "TimeoutError" || e?.name === "AbortError";
-    throw Object.assign(
-      new Error(`${provider.name}: ${timedOut ? `no answer within ${Math.round(limit / 1000)}s` : `unreachable (${e?.message || e})`}`),
-      { retryable: true, overloaded: timedOut },
-    );
-  }
-  const text = await res.text();
-  if (!res.ok) {
-    // 429 / 5xx are temporary; 4xx (bad key, bad model, image too big) are not.
-    throw Object.assign(new Error(`${provider.name} ${res.status}: ${text.slice(0, 250)}`), {
-      retryable: res.status === 429 || res.status >= 500,
-      overloaded: res.status === 429 || res.status >= 500,
-      dailyLimit: res.status === 429 && isDailyLimit(text),
-      modelMissing: res.status === 404 || (res.status === 400 && /model/i.test(text) && /not found|not supported|invalid|unknown/i.test(text)),
-    });
-  }
-  const data = JSON.parse(text);
-  if (data?.error) throw Object.assign(new Error(`${provider.name}: ${JSON.stringify(data.error).slice(0, 250)}`), { retryable: true });
-  provider.onModelWorked?.(provider.models[0]);
-  return {
-    content: data?.choices?.[0]?.message?.content ?? "",
-    model: data?.model || provider.models[0],
-    ms: Date.now() - started,
+  const firstDataMs = provider.firstDataMs ?? 45_000; // no sign of life for this long -> give up
+  const ctrl = new AbortController();
+  let reason = "";
+  const abort = (why) => { reason = why; ctrl.abort(); };
+  const overall = setTimeout(() => abort(`no complete answer within ${Math.round(limit / 1000)}s`), limit);
+  let idle = setTimeout(() => abort(`could not connect: the server did not respond within ${Math.round(firstDataMs / 1000)}s`), firstDataMs);
+  const alive = (ms = 90_000, why = `stopped answering (silent for ${ms / 1000}s)`) => {
+    clearTimeout(idle);
+    idle = setTimeout(() => abort(why), ms);
   };
+  const fail = (msg, extra = {}) => Object.assign(new Error(`${provider.name}: ${msg}`), { retryable: true, ...extra });
+  const timing = { connectMs: null, firstTokenMs: null };
+
+  try {
+    let res;
+    try {
+      res = await fetch(`${provider.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+        method: "POST",
+        signal: ctrl.signal,
+        headers: {
+          Authorization: `Bearer ${provider.key}`,
+          "Content-Type": "application/json",
+          Accept: "text/event-stream, application/json",
+          ...(provider.extraHeaders || {}),
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (e) {
+      throw fail(reason || `unreachable (${e?.message || e})`, { overloaded: !!reason });
+    }
+    timing.connectMs = Date.now() - started;
+    // Connected: now wait for the first words.
+    alive(firstDataMs, `connected after ${(timing.connectMs / 1000).toFixed(1)}s, but the model did not start answering within ${Math.round(firstDataMs / 1000)}s (busy or thinking too long)`);
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      // 429 / 5xx are temporary; 4xx (bad key, bad model, image too big) are not.
+      throw Object.assign(new Error(`${provider.name} ${res.status}: ${text.slice(0, 250)}`), {
+        retryable: res.status === 429 || res.status >= 500,
+        overloaded: res.status === 429 || res.status >= 500,
+        dailyLimit: res.status === 429 && isDailyLimit(text),
+        modelMissing: res.status === 404 || (res.status === 400 && /model/i.test(text) && /not found|not supported|invalid|unknown/i.test(text)),
+      });
+    }
+
+    let content = "";
+    let model = provider.models[0];
+    const isStream = (res.headers.get("content-type") || "").includes("text/event-stream");
+    try {
+      if (!isStream) {
+        // Some servers ignore stream:true and send one JSON answer.
+        const raw = await Promise.race([
+          res.text(),
+          new Promise((_, reject) => ctrl.signal.addEventListener("abort", () => reject(new Error(reason)), { once: true })),
+        ]);
+        const data = JSON.parse(raw);
+        if (data?.error) throw fail(JSON.stringify(data.error).slice(0, 250), { dailyLimit: isDailyLimit(JSON.stringify(data.error)) });
+        content = data?.choices?.[0]?.message?.content ?? "";
+        model = data?.model || model;
+        timing.firstTokenMs = Date.now() - started;
+      } else {
+        const reader = res.body.getReader();
+        // When we give up (timeout), stop reading too, so nothing keeps waiting on a dead stream.
+        ctrl.signal.addEventListener("abort", () => reader.cancel().catch(() => {}), { once: true });
+        const decoder = new TextDecoder();
+        let buf = "";
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (ctrl.signal.aborted) throw new Error(reason);
+          if (done) break;
+          alive(); // any bytes (including keep-alive comments) = still working
+          buf += decoder.decode(value, { stream: true });
+          let nl;
+          while ((nl = buf.indexOf("\n")) !== -1) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (!line.startsWith("data:")) continue; // ": keep-alive" comments, blank lines
+            const payload = line.slice(5).trim();
+            if (payload === "[DONE]") continue;
+            let evt;
+            try { evt = JSON.parse(payload); } catch { continue; }
+            if (evt.error) {
+              const t = JSON.stringify(evt.error);
+              throw fail(t.slice(0, 250), { overloaded: true, dailyLimit: isDailyLimit(t) });
+            }
+            model = evt.model || model;
+            const delta = evt.choices?.[0]?.delta ?? {};
+            const piece = delta.content ?? evt.choices?.[0]?.message?.content ?? "";
+            if ((piece || delta.reasoning || delta.reasoning_content) && timing.firstTokenMs === null) timing.firstTokenMs = Date.now() - started;
+            content += piece || "";
+          }
+        }
+      }
+    } catch (e) {
+      if (e?.retryable !== undefined) throw e;
+      throw fail(reason || `connection broke (${e?.message || e})`, { overloaded: true });
+    }
+    provider.onModelWorked?.(provider.models[0]);
+    return { content, model, ms: Date.now() - started, ...timing };
+  } finally {
+    clearTimeout(overall);
+    clearTimeout(idle);
+  }
 }
 
 /** Cloudflare Workers AI through the AI binding (no key needed; free daily allowance). */
@@ -317,38 +385,35 @@ async function openRouterKeyInfo(env) {
   return JSON.parse(text).data || {};
 }
 
-/** Tiny request per provider, used by /check: is the key valid, which model, how fast. */
+/** Tiny request per provider, used by /check: is the key valid, which model, how fast. Runs in parallel. */
 export async function pingProviders(env) {
-  const out = [];
-  for (const provider of providers(env)) {
+  return Promise.all(providers(env).map(async (provider) => {
     if (provider.name === "OpenRouter") {
       // Check the key without spending one of the (few) free daily requests.
       try {
         const info = await openRouterKeyInfo(env);
         await provider.resolve?.();
         const paused = isPaused("OpenRouter");
-        out.push({
+        return {
           name: "OpenRouter", ok: !paused, keyOnly: true, model: provider.models[0], freeTier: info.is_free_tier,
           error: paused ? "daily free limit used up (resets at 00:00 UTC)" : undefined,
-        });
+        };
       } catch (e) {
-        out.push({ name: "OpenRouter", ok: false, model: provider.models.join(", ") || "-", error: e.message });
+        return { name: "OpenRouter", ok: false, model: provider.models.join(", ") || "-", error: e.message };
       }
-      continue;
     }
     try {
       await provider.resolve?.();
-      const r = await chat(provider, "Reply with the single word: OK", {
+      const r = await chat({ ...provider, firstDataMs: 40_000 }, "Reply with the single word: OK", {
         maxTokens: 2000,
         system: "You are a helpful assistant.",
-        timeoutMs: 25_000,
+        timeoutMs: 55_000,
       });
-      out.push({ name: provider.name, ok: true, ...r });
+      return { name: provider.name, ok: true, ...r };
     } catch (e) {
-      out.push({ name: provider.name, ok: false, model: provider.models.join(", "), error: e.message });
+      return { name: provider.name, ok: false, model: provider.models.join(", "), error: e.message };
     }
-  }
-  return out;
+  }));
 }
 
 /** Pull the JSON object out of a model reply (tolerates <think> blocks and ``` fences). */
