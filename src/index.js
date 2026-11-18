@@ -36,14 +36,15 @@ export default {
   async queue(batch, env) {
     for (const msg of batch.messages) {
       try {
-        await processChunk(env, msg.body.quizId, msg.body.idx);
+        await processChunk(env, msg.body.quizId, msg.body.idx, msg.body.progress);
         msg.ack();
       } catch (err) {
         console.error("chunk failed", msg.body, err?.message);
         if (err.retryable !== false && msg.attempts < 4) {
           msg.retry({ delaySeconds: 20 * msg.attempts });
+          await showProgress(env, msg.body.quizId, msg.body.progress, "⏳ The AI is busy, retrying a part in a moment…");
         } else {
-          await failChunk(env, msg.body.quizId, msg.body.idx, String(err.message || err));
+          await failChunk(env, msg.body.quizId, msg.body.idx, String(err.message || err), msg.body.progress);
           msg.ack();
         }
       }
@@ -311,16 +312,54 @@ async function startProcessing(env, quiz, chat) {
   ).bind(chunks.length, quiz.id));
   await env.DB.batch(stmts);
 
-  const messages = chunks.map((_, idx) => ({ body: { quizId: quiz.id, idx } }));
+  const sent = await api.send(chat, progressText({ ...quiz, chunks_total: chunks.length, chunks_done: 0, chunks_failed: 0 }, 0));
+  const progress = { chat, msg: sent.message_id };
+  const messages = chunks.map((_, idx) => ({ body: { quizId: quiz.id, idx, progress } }));
   for (let i = 0; i < messages.length; i += 100) await env.QUIZ_QUEUE.sendBatch(messages.slice(i, i + 100));
+}
 
-  return api.send(chat,
-    `🤖 Processing <b>${esc(quiz.title)}</b> in ${chunks.length} part(s)…\nThe AI is reading the questions and finding the correct answers. I'll message you when it's ready (usually a few minutes).`);
+// ───────────────────────────── progress message ─────────────────────────────
+
+function progressBar(fraction, width = 12) {
+  const full = Math.round(Math.max(0, Math.min(1, fraction)) * width);
+  return "▓".repeat(full) + "░".repeat(width - full);
+}
+
+function progressText(quiz, found, note = "") {
+  const total = Math.max(quiz.chunks_total, 1);
+  const handled = quiz.chunks_done + quiz.chunks_failed;
+  const pct = Math.round((100 * handled) / total);
+  let t = `🤖 <b>${esc(quiz.title)}</b>\n\n${progressBar(handled / total)} ${pct}%\n`;
+  t += `Parts read: <b>${handled}/${quiz.chunks_total}</b>\nQuestions found so far: <b>${found}</b>`;
+  if (quiz.chunks_failed) t += `\n⚠️ Failed parts: ${quiz.chunks_failed}`;
+  t += handled < quiz.chunks_total
+    ? `\n\nThe AI is reading the questions and finding the correct answers…`
+    : `\n\n✅ Done.`;
+  if (note) t += `\n${note}`;
+  return t;
+}
+
+/** Update the "Processing…" message in place. Never fails the job if Telegram refuses the edit. */
+async function showProgress(env, quizId, progress, note = "") {
+  if (!progress?.msg) return;
+  try {
+    const quiz = await env.DB.prepare("SELECT * FROM quizzes WHERE id = ?").bind(quizId).first();
+    if (!quiz) return;
+    const { n } = await env.DB.prepare("SELECT COUNT(*) AS n FROM questions WHERE quiz_id = ?").bind(quizId).first();
+    await tg(env).call("editMessageText", {
+      chat_id: progress.chat,
+      message_id: progress.msg,
+      text: progressText(quiz, n, note),
+      parse_mode: "HTML",
+    });
+  } catch (e) {
+    // "message is not modified" or a deleted message: nothing to do.
+  }
 }
 
 // ───────────────────────────── queue consumer ─────────────────────────────
 
-async function processChunk(env, quizId, idx) {
+async function processChunk(env, quizId, idx, progress) {
   const chunk = await env.DB.prepare("SELECT * FROM chunks WHERE quiz_id = ? AND idx = ?").bind(quizId, idx).first();
   if (!chunk || chunk.status !== "pending") return; // deleted quiz or already handled
 
@@ -342,16 +381,18 @@ async function processChunk(env, quizId, idx) {
     env.DB.prepare("UPDATE chunks SET status = 'done', error = NULL WHERE quiz_id = ? AND idx = ?").bind(quizId, idx),
     env.DB.prepare("UPDATE quizzes SET chunks_done = chunks_done + 1 WHERE id = ? RETURNING *").bind(quizId),
   ]);
+  await showProgress(env, quizId, progress);
   await maybeFinish(env, res[res.length - 1].results[0]);
 }
 
-async function failChunk(env, quizId, idx, error) {
+async function failChunk(env, quizId, idx, error, progress) {
   const chunk = await env.DB.prepare("SELECT status FROM chunks WHERE quiz_id = ? AND idx = ?").bind(quizId, idx).first();
   if (!chunk || chunk.status !== "pending") return;
   const res = await env.DB.batch([
     env.DB.prepare("UPDATE chunks SET status = 'failed', error = ? WHERE quiz_id = ? AND idx = ?").bind(error.slice(0, 500), quizId, idx),
     env.DB.prepare("UPDATE quizzes SET chunks_failed = chunks_failed + 1 WHERE id = ? RETURNING *").bind(quizId),
   ]);
+  await showProgress(env, quizId, progress);
   await maybeFinish(env, res[1].results[0]);
 }
 
@@ -398,8 +439,11 @@ async function retryFailed(env, quiz, chat) {
     env.DB.prepare("UPDATE chunks SET status = 'pending' WHERE quiz_id = ? AND status = 'failed'").bind(quiz.id),
     env.DB.prepare("UPDATE quizzes SET status = 'processing', chunks_failed = 0, chunks_done = chunks_total - ? WHERE id = ?").bind(results.length, quiz.id),
   ]);
-  await env.QUIZ_QUEUE.sendBatch(results.map((r) => ({ body: { quizId: quiz.id, idx: r.idx } })));
-  return api.send(chat, `🔁 Retrying ${results.length} part(s) of <b>${esc(quiz.title)}</b>…`);
+  const fresh = await env.DB.prepare("SELECT * FROM quizzes WHERE id = ?").bind(quiz.id).first();
+  const { n } = await env.DB.prepare("SELECT COUNT(*) AS n FROM questions WHERE quiz_id = ?").bind(quiz.id).first();
+  const sent = await api.send(chat, progressText(fresh, n, `🔁 Retrying ${results.length} failed part(s)…`));
+  const progress = { chat, msg: sent.message_id };
+  await env.QUIZ_QUEUE.sendBatch(results.map((r) => ({ body: { quizId: quiz.id, idx: r.idx, progress } })));
 }
 
 // ───────────────────────────── managing quizzes ─────────────────────────────
