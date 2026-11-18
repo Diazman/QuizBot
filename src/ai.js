@@ -1,9 +1,9 @@
 // Turns raw question text (or a picture of questions) into the bot's JSON format.
 //
-// Providers, tried in order:
-//   1. NVIDIA  (NVIDIA_API_KEY)      – z-ai/glm-5.3-flash by default
-//   2. OpenRouter (OPENROUTER_API_KEY) – the best *free* model currently available,
+// Providers, tried in order (change with the AI_ORDER variable, e.g. "nvidia,openrouter"):
+//   1. OpenRouter (OPENROUTER_API_KEY) – the best *free* model currently available,
 //      picked at runtime from OpenRouter's live model list.
+//   2. NVIDIA  (NVIDIA_API_KEY)      – z-ai/glm-5.3-flash by default
 // Both speak the OpenAI-compatible /chat/completions format.
 
 const NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1";
@@ -62,7 +62,7 @@ const pausedUntil = {};
 export const isPaused = (name) => (pausedUntil[name] || 0) > Date.now();
 export const resetPauses = () => { for (const k of Object.keys(pausedUntil)) delete pausedUntil[k]; };
 
-/** Try NVIDIA, then OpenRouter. Bad JSON from a model also counts as a failure. */
+/** Try OpenRouter, then NVIDIA. Bad JSON from a model also counts as a failure. */
 async function withFallback(env, { userContent, vision }) {
   const errors = [];
   const all = providers(env, vision);
@@ -95,8 +95,7 @@ export function providers(env, vision = false) {
       baseUrl: env.NVIDIA_BASE_URL || NVIDIA_BASE_URL,
       key: env.NVIDIA_API_KEY,
       models: [(vision && env.NVIDIA_VISION_MODEL) || env.NVIDIA_MODEL || NVIDIA_MODEL],
-      // With a backup available, don't wait long for a slow NVIDIA.
-      timeoutMs: Number(env.NVIDIA_TIMEOUT_MS) || (env.OPENROUTER_API_KEY ? 90_000 : 300_000),
+      timeoutMs: Number(env.NVIDIA_TIMEOUT_MS) || 120_000,
     });
   }
   if (env.OPENROUTER_API_KEY) {
@@ -105,7 +104,7 @@ export function providers(env, vision = false) {
       baseUrl: env.OPENROUTER_BASE_URL || OPENROUTER_BASE_URL,
       key: env.OPENROUTER_API_KEY,
       models: env.OPENROUTER_MODEL ? [env.OPENROUTER_MODEL] : [],
-      timeoutMs: Number(env.OPENROUTER_TIMEOUT_MS) || 240_000,
+      timeoutMs: Number(env.OPENROUTER_TIMEOUT_MS) || 180_000,
       extraHeaders: { "X-Title": "QuizBot" },
       async resolve() {
         if (provider.models.length) return;
@@ -121,7 +120,14 @@ export function providers(env, vision = false) {
     };
     list.push(provider);
   }
-  return list;
+  const order = String(env.AI_ORDER || "openrouter,nvidia").toLowerCase().split(",").map((x) => x.trim());
+  const pos = (p) => { const i = order.indexOf(p.name.toLowerCase()); return i === -1 ? order.length : i; };
+  return list.sort((a, b) => pos(a) - pos(b));
+}
+
+/** True if an error text means "the AI services are busy", not "something is broken". */
+export function isOverloadError(text) {
+  return /\b(429|5\d\d)\b|no answer within|unreachable|overload|busy|rate.?limit|no free .*model available|could not load the model list/i.test(String(text || ""));
 }
 
 let freeModelsCache = null; // { at, models }

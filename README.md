@@ -65,8 +65,8 @@ Every push to `main` now redeploys the bot automatically.
 ### 4. Add the keys
 Open the **quizbot** worker and go to **Settings → Variables and Secrets**. Add these two entries with type **Secret**:
 - `TELEGRAM_BOT_TOKEN`: the BotFather token
-- `NVIDIA_API_KEY`: your NVIDIA key (`nvapi-…`)
-- `OPENROUTER_API_KEY` (optional, recommended): backup AI. If NVIDIA fails, times out or returns unusable output, the bot uses the strongest **free** OpenRouter model available at that moment. It looks up OpenRouter's live model list, prefers Nemotron 3.5 Super VL, and sends up to 3 models so OpenRouter can switch between them when one is busy.
+- `OPENROUTER_API_KEY`: the main AI. The bot uses the strongest **free** OpenRouter model available at that moment. It looks up OpenRouter's live model list, prefers Nemotron 3.5 Super VL, and sends up to 3 models so OpenRouter can switch between them when one is busy.
+- `NVIDIA_API_KEY`: the backup AI (`z-ai/glm-5.3-flash`), used when OpenRouter fails. If both fail, the bot says the AI is overloaded and to try again later with `/retry`.
 
 ### 5. Connect Telegram
 Open `https://quizbot.<your-subdomain>.workers.dev/setup` once. It should say "✅ Telegram is connected". Then send `/start` to your bot.
@@ -98,6 +98,7 @@ Telegram ──webhook──▶ Worker (fetch) ──▶ D1: quizzes, questions,
 
 In `wrangler.toml` under `[vars]`:
 - `NVIDIA_MODEL`: defaults to `z-ai/glm-5.3-flash`
+- `AI_ORDER`: optional; defaults to `openrouter,nvidia`. Set it to `nvidia,openrouter` to try NVIDIA first.
 - `OPENROUTER_MODEL`: optional; pins one OpenRouter model instead of picking the best free one automatically
 - `BOT_USERNAME`: optional; the bot looks it up itself if you leave it out
 

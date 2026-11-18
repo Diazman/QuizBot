@@ -2,7 +2,7 @@
 //  fetch: Telegram webhook (commands, uploads, poll answers)
 //  queue: AI processing of question chunks (runs in the background, retried on failure)
 
-import { extractQuestions, extractQuestionsFromImage, pingProviders } from "./ai.js";
+import { extractQuestions, extractQuestionsFromImage, isOverloadError, pingProviders } from "./ai.js";
 import { buildPoll, countImages, imageMarker, normalizeQuestion, parseImageMarker, parseQuizJson, planChunks, randomCode, shuffle } from "./format.js";
 import { fileToText, pdfJpegImages } from "./files.js";
 import { esc, tg, webhookSecret } from "./telegram.js";
@@ -47,7 +47,7 @@ export default {
         console.error("chunk failed", msg.body, err?.message);
         if (err.retryable !== false && msg.attempts < 4) {
           msg.retry({ delaySeconds: 20 * msg.attempts });
-          await showProgress(env, msg.body.quizId, msg.body.progress, "⏳ The AI is busy, retrying a part in a moment…");
+          await showProgress(env, msg.body.quizId, msg.body.progress, "⏳ The AI is busy, retrying in a moment…");
         } else {
           await failChunk(env, msg.body.quizId, msg.body.idx, String(err.message || err), msg.body.progress);
           msg.ack();
@@ -214,7 +214,7 @@ async function runCheck(env, chat, uid, code) {
       lines.push(`❌ ${p.name} (<code>${esc(p.model)}</code>): ${esc(p.error).slice(0, 250)}`);
     }
   }
-  if (pings.length > 1) lines.push("ℹ️ NVIDIA is used first; OpenRouter is the backup when NVIDIA fails.");
+  if (pings.length > 1) lines.push(`ℹ️ ${pings[0].name} is used first; ${pings[1].name} is the backup.`);
 
   if (code) {
     const quiz = await ownedQuiz(env, uid, code);
@@ -455,6 +455,10 @@ async function maybeFinish(env, quiz) {
   const api = tg(env);
   if (status === "failed") {
     const err = await env.DB.prepare("SELECT error FROM chunks WHERE quiz_id = ? AND error IS NOT NULL LIMIT 1").bind(quiz.id).first();
+    if (err && isOverloadError(err.error)) {
+      return api.send(quiz.owner_id,
+        `😔 The AI is overloaded right now, so <b>${esc(quiz.title)}</b> couldn't be processed.\nPlease try again in a few minutes: /retry ${quiz.code}`);
+    }
     return api.send(quiz.owner_id,
       `❌ Could not build <b>${esc(quiz.title)}</b>: no questions were recognised.${err ? `\nLast error: <code>${esc(err.error)}</code>` : ""}\nTry /retry ${quiz.code}`);
   }
@@ -466,7 +470,12 @@ async function readyMessage(env, quiz, count, failedParts) {
   const { low } = await env.DB.prepare("SELECT COUNT(*) AS low FROM questions WHERE quiz_id = ? AND confidence = 'low'").bind(quiz.id).first();
   let text = `✅ <b>${esc(quiz.title)}</b> is ready: <b>${count}</b> questions.\n\n🔗 Share this link to let anyone practise:\n${link}\n\nCode: <code>${quiz.code}</code> — /practice ${quiz.code}`;
   if (low) text += `\n\n⚠️ The AI was unsure about ${low} answer(s). Check them with /export ${quiz.code} (look for "confidence": "low"), fix, and upload the JSON back.`;
-  if (failedParts) text += `\n\n⚠️ ${failedParts} part(s) failed to process. Use /retry ${quiz.code}.`;
+  if (failedParts) {
+    const err = await env.DB.prepare("SELECT error FROM chunks WHERE quiz_id = ? AND status = 'failed' LIMIT 1").bind(quiz.id).first();
+    text += err && isOverloadError(err.error)
+      ? `\n\n⚠️ ${failedParts} part(s) were skipped because the AI is overloaded right now. Try again later with /retry ${quiz.code} to add the missing questions.`
+      : `\n\n⚠️ ${failedParts} part(s) failed to process. Use /retry ${quiz.code}.`;
+  }
   return text;
 }
 
