@@ -77,6 +77,7 @@ async function setup(env, origin) {
         { command: "my", description: "My quizzes and share links" },
         { command: "practice", description: "Practise a quiz by code" },
         { command: "export", description: "Download a quiz as JSON" },
+        { command: "delete", description: "Delete or stop quizzes" },
         { command: "check", description: "Test the AI / see why a quiz is stuck" },
         { command: "check", description: "Test the AI / see why a quiz is stuck" },
     { command: "stop", description: "Stop the current quiz" },
@@ -145,7 +146,7 @@ async function handleUpdate(update, env) {
       return exportQuiz(env, uid, chat, arg);
     case "/delete": {
       const quiz = await ownedQuiz(env, uid, arg);
-      if (!quiz) return api.send(chat, "Usage: /delete <i>code</i> (see /my)");
+      if (!quiz) return listQuizzes(env, uid, chat); // no/unknown code: show the list with 🗑 buttons
       await deleteQuiz(env, quiz.id);
       return api.send(chat, `🗑 Deleted <b>${esc(quiz.title)}</b>.`);
     }
@@ -188,7 +189,7 @@ After processing you get a link. Anyone who opens it gets the questions as Teleg
 /practice <i>code</i> — practise a quiz
 /export <i>code</i> — download the quiz in bot format (JSON). Edit it and upload it back to fix answers.
 /retry <i>code</i> — re-run parts that failed or got stuck
-/delete <i>code</i> — delete a quiz
+/delete — delete quizzes (also stops ones that are still processing). Or use the 🗑 buttons in /my
 /check <i>code</i> — test the AI and see why a quiz is stuck
 /stop — stop the current practice
 /cancel — discard the current draft`;
@@ -363,7 +364,8 @@ async function startProcessing(env, quiz, chat) {
   ).bind(chunks.length, quiz.id));
   await env.DB.batch(stmts);
 
-  const sent = await api.send(chat, progressText({ ...quiz, chunks_total: chunks.length, chunks_done: 0, chunks_failed: 0 }, 0));
+  const sent = await api.send(chat, progressText({ ...quiz, chunks_total: chunks.length, chunks_done: 0, chunks_failed: 0 }, 0),
+    { reply_markup: stopKeyboard(quiz.code) });
   const progress = { chat, msg: sent.message_id };
   const messages = chunks.map((_, idx) => ({ body: { quizId: quiz.id, idx, progress } }));
   for (let i = 0; i < messages.length; i += 100) await env.QUIZ_QUEUE.sendBatch(messages.slice(i, i + 100));
@@ -390,6 +392,8 @@ function progressText(quiz, found, note = "") {
   return t;
 }
 
+const stopKeyboard = (code) => ({ inline_keyboard: [[{ text: "⏹ Stop & delete", callback_data: `del:${code}` }]] });
+
 /** Update the "Processing…" message in place. Never fails the job if Telegram refuses the edit. */
 async function showProgress(env, quizId, progress, note = "") {
   if (!progress?.msg) return;
@@ -397,11 +401,13 @@ async function showProgress(env, quizId, progress, note = "") {
     const quiz = await env.DB.prepare("SELECT * FROM quizzes WHERE id = ?").bind(quizId).first();
     if (!quiz) return;
     const { n } = await env.DB.prepare("SELECT COUNT(*) AS n FROM questions WHERE quiz_id = ?").bind(quizId).first();
+    const running = quiz.chunks_done + quiz.chunks_failed < quiz.chunks_total;
     await tg(env).call("editMessageText", {
       chat_id: progress.chat,
       message_id: progress.msg,
       text: progressText(quiz, n, note),
       parse_mode: "HTML",
+      reply_markup: running ? stopKeyboard(quiz.code) : { inline_keyboard: [] },
     });
   } catch (e) {
     // "message is not modified" or a deleted message: nothing to do.
@@ -427,13 +433,22 @@ async function processChunk(env, quizId, idx, progress) {
   }
   const questions = raw.map(normalizeQuestion).filter(Boolean);
 
+  // Everything is conditional on the part still waiting: if the quiz was deleted (or the
+  // part was already handled) while the AI was working, the result is simply dropped.
+  const stillPending = "EXISTS (SELECT 1 FROM chunks WHERE quiz_id = ? AND idx = ? AND status = 'pending')";
   const res = await env.DB.batch([
-    ...questionInserts(env, quizId, idx * 1000, questions),
-    env.DB.prepare("UPDATE chunks SET status = 'done', error = NULL WHERE quiz_id = ? AND idx = ?").bind(quizId, idx),
-    env.DB.prepare("UPDATE quizzes SET chunks_done = chunks_done + 1 WHERE id = ? RETURNING *").bind(quizId),
+    ...questions.map((q, i) =>
+      env.DB.prepare(
+        `INSERT INTO questions (quiz_id, position, question, options, correct, explanation, confidence)
+         SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${stillPending}`,
+      ).bind(quizId, idx * 1000 + i, q.question, JSON.stringify(q.options), q.correct, q.explanation || null, q.confidence || null, quizId, idx)),
+    env.DB.prepare("UPDATE quizzes SET chunks_done = chunks_done + 1 WHERE id = ? AND " + stillPending + " RETURNING *").bind(quizId, quizId, idx),
+    env.DB.prepare("UPDATE chunks SET status = 'done', error = NULL WHERE quiz_id = ? AND idx = ? AND status = 'pending'").bind(quizId, idx),
   ]);
+  const quizRow = res[res.length - 2].results[0];
+  if (!quizRow) return; // deleted or already handled
   await showProgress(env, quizId, progress);
-  await maybeFinish(env, res[res.length - 1].results[0]);
+  await maybeFinish(env, quizRow);
 }
 
 async function failChunk(env, quizId, idx, error, progress) {
@@ -502,7 +517,7 @@ async function retryFailed(env, quiz, chat) {
   ]);
   const fresh = await env.DB.prepare("SELECT * FROM quizzes WHERE id = ?").bind(quiz.id).first();
   const { n } = await env.DB.prepare("SELECT COUNT(*) AS n FROM questions WHERE quiz_id = ?").bind(quiz.id).first();
-  const sent = await api.send(chat, progressText(fresh, n, `🔁 Retrying ${results.length} part(s)…`));
+  const sent = await api.send(chat, progressText(fresh, n, `🔁 Retrying ${results.length} part(s)…`), { reply_markup: stopKeyboard(quiz.code) });
   const progress = { chat, msg: sent.message_id };
   await env.QUIZ_QUEUE.sendBatch(results.map((r) => ({ body: { quizId: quiz.id, idx: r.idx, progress } })));
 }
@@ -537,13 +552,25 @@ async function listQuizzes(env, uid, chat) {
   if (!results.length) return api.send(chat, "You have no quizzes yet. Start with /new <i>title</i>.");
   const icon = { draft: "📝", processing: "⏳", ready: "✅", failed: "❌" };
   const lines = [];
+  const keyboard = [];
+  const short = (t) => (t.length > 22 ? t.slice(0, 21) + "…" : t);
   for (const q of results) {
     let line = `${icon[q.status] || "•"} <b>${esc(q.title)}</b> — ${q.n} questions — <code>${q.code}</code>`;
     if (q.status === "processing") line += ` (${q.chunks_done + q.chunks_failed}/${q.chunks_total} parts)`;
+    if (q.status === "draft") line += " (draft: send /done to process)";
     if (q.status === "ready") line += `\n    ${await shareLink(env, q.code)}`;
     lines.push(line);
+    if (keyboard.length < 20) {
+      const row = q.status === "ready"
+        ? [{ text: `▶️ ${short(q.title)}`, callback_data: `prac:${q.code}` }, { text: "📤", callback_data: `exp:${q.code}` }]
+        : [{ text: `${icon[q.status] || "•"} ${short(q.title)}`, callback_data: `prac:${q.code}` }];
+      row.push({ text: q.status === "processing" ? "⏹🗑" : "🗑", callback_data: `del:${q.code}` });
+      keyboard.push(row);
+    }
   }
-  return api.send(chat, lines.join("\n"));
+  keyboard.push([{ text: "🗑 Delete all my quizzes", callback_data: "delall" }]);
+  lines.push("\n▶️ practise · 📤 export · 🗑 delete · ⏹🗑 stop & delete");
+  return api.send(chat, lines.join("\n"), { reply_markup: { inline_keyboard: keyboard } });
 }
 
 async function exportQuiz(env, uid, chat, code) {
@@ -566,6 +593,61 @@ async function exportQuiz(env, uid, chat, code) {
     `${results.length} questions. "correct" is the 0-based index of the right option. Edit and send this file back to create a corrected quiz.`);
 }
 
+// ───────────────────────────── delete / manage buttons ─────────────────────────────
+
+async function onManageCallback(env, cb, kind, code) {
+  const api = tg(env);
+  const uid = cb.from.id;
+  const chat = cb.message.chat.id;
+  const edit = (text, keyboard = []) =>
+    api.call("editMessageText", {
+      chat_id: chat, message_id: cb.message.message_id, text, parse_mode: "HTML",
+      reply_markup: { inline_keyboard: keyboard },
+    }).catch(() => api.send(chat, text, { reply_markup: { inline_keyboard: keyboard } }));
+
+  switch (kind) {
+    case "prac":
+      return offerQuiz(env, chat, code);
+    case "exp":
+      return exportQuiz(env, uid, chat, code);
+    case "del": {
+      const quiz = await ownedQuiz(env, uid, code);
+      if (!quiz) return api.send(chat, "That quiz no longer exists.");
+      const { n } = await env.DB.prepare("SELECT COUNT(*) AS n FROM questions WHERE quiz_id = ?").bind(quiz.id).first();
+      const what = quiz.status === "processing" ? "This stops the AI and deletes" : "This deletes";
+      return api.send(chat,
+        `🗑 Delete <b>${esc(quiz.title)}</b>?\n${what} the quiz and its ${n} question(s). People with the link won't be able to open it any more.`,
+        { reply_markup: { inline_keyboard: [[
+          { text: "Yes, delete", callback_data: `delyes:${quiz.code}` },
+          { text: "Cancel", callback_data: "delno" },
+        ]] } });
+    }
+    case "delyes": {
+      const quiz = await ownedQuiz(env, uid, code);
+      if (!quiz) return edit("Already deleted.");
+      await deleteQuiz(env, quiz.id);
+      return edit(`🗑 Deleted <b>${esc(quiz.title)}</b>.`);
+    }
+    case "delno":
+      return edit("Cancelled. Nothing was deleted.");
+    case "delall": {
+      const { n } = await env.DB.prepare("SELECT COUNT(*) AS n FROM quizzes WHERE owner_id = ?").bind(uid).first();
+      if (!n) return api.send(chat, "You have no quizzes.");
+      return api.send(chat, `⚠️ Delete <b>all ${n}</b> of your quizzes? This also stops any that are still processing. This can't be undone.`, {
+        reply_markup: { inline_keyboard: [[
+          { text: `Yes, delete all ${n}`, callback_data: "delallyes" },
+          { text: "Cancel", callback_data: "delno" },
+        ]] },
+      });
+    }
+    case "delallyes": {
+      const { results } = await env.DB.prepare("SELECT id FROM quizzes WHERE owner_id = ?").bind(uid).all();
+      for (const r of results) await deleteQuiz(env, r.id);
+      return edit(`🗑 Deleted ${results.length} quiz(zes).`);
+    }
+  }
+}
+
 // ───────────────────────────── practice ─────────────────────────────
 
 async function offerQuiz(env, chat, code) {
@@ -585,7 +667,8 @@ async function onCallback(cb, env) {
   const api = tg(env);
   await api.call("answerCallbackQuery", { callback_query_id: cb.id }).catch(() => {});
   const [kind, code, countStr] = (cb.data || "").split(":");
-  if (kind !== "go" || !cb.message) return;
+  if (!cb.message) return;
+  if (kind !== "go") return onManageCallback(env, cb, kind, code);
   const quiz = await env.DB.prepare("SELECT * FROM quizzes WHERE code = ? AND status = 'ready'").bind(code).first();
   if (!quiz) return api.send(cb.message.chat.id, "Quiz not found.");
   const { results } = await env.DB.prepare("SELECT id FROM questions WHERE quiz_id = ?").bind(quiz.id).all();

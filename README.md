@@ -41,7 +41,7 @@ This is what the AI produces. You can download it with `/export <code>`:
 | `/practice <code>` | Practise a quiz |
 | `/export <code>` | Download the quiz as JSON (owner only) |
 | `/retry <code>` | Re-run parts that failed (for example after an API rate limit) |
-| `/delete <code>` | Delete a quiz |
+| `/delete` | Delete quizzes, including ones still processing (stops the AI). Also available as 🗑 buttons in `/my` and as **⏹ Stop & delete** on the progress message |
 | `/stop` | Stop the current practice |
 | `/cancel` | Throw away the current draft |
 

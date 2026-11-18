@@ -33,6 +33,7 @@ await call("setMyCommands", {
     { command: "my", description: "My quizzes and share links" },
     { command: "practice", description: "Practise a quiz by code" },
     { command: "export", description: "Download a quiz as JSON" },
+    { command: "delete", description: "Delete or stop quizzes" },
     { command: "check", description: "Test the AI / see why a quiz is stuck" },
     { command: "stop", description: "Stop the current quiz" },
     { command: "help", description: "How it works" },
